@@ -1,0 +1,113 @@
+#import "JITAllocator.h"
+#import "FEXBridge.h"
+#import "WineServerBridge.h"
+#import "WineProcessBridge.h"
+#import "IOSDisplayShim.h"
+#import "Winios/Winios.h"
+#import "Winios/WiniosCursor.h"
+#import "MemoryHostTest.h"
+// ml2106: rumble / DualSense output to the physical pad (PadOutput.m)
+#import "PadOutput.h"
+// Steam content decoders (liblzma shim, zstd decoder, zip chunks), used by the owned library's downloads.
+#import "SwiftSteam/lzma_shim.h"
+// itch.io .7z downloads (ItchArchive.swift): a streaming 7z reader over liblzma and zlib.
+#import "SwiftItch/itch_7z.h"
+// On-device remote pairing for Built-in StikJIT (build/rppairing-ios, JITPairing.swift).
+#import "MadeiraRPPairing.h"
+// madeira-bcd: the bundled prefix template, read by the Dock's Reset (DockReset.swift).
+#include "PrefixExtractor.h"
+#include "CabinetReader.h"
+
+// Wine file-based logging (server_ios.c)
+void wine_log_set_file(const char *path);
+
+// UI log callback (wine_log_ios.c) — forwards C logs to Swift UI
+typedef void (*wine_ui_log_callback_t)(const char *message);
+void wine_set_ui_log_callback(wine_ui_log_callback_t cb);
+
+// Madeira in the background (audio_null_ios.c, BackgroundRun.swift): keep the
+// RemoteIO endpoint running with no client (keepalive), render silence (mute),
+// or stop it so iOS can suspend Madeira (halt). Returns 1 when it runs.
+int madeira_audio_background(int keepalive, int mute, int halt);
+// Start the endpoint again after an audio interruption ended.
+void madeira_audio_resume_after_interruption(void);
+// Restart a running endpoint that rendered nothing since the last call (1 = restarted).
+int madeira_audio_check(void);
+// CPU cap while Madeira runs in the background (Winios/BackgroundCPUCap.c):
+// percent of one core, 0 = off (returns once every held thread runs again).
+void madeira_bg_cpu_cap(int percent);
+void madeira_bg_cpu_stats(double *cpu_s, double *wall_s, double *held_s);
+// Metal command buffers off the main thread wait while Madeira is inactive
+// (Winios/MetalBackgroundGate.m). Returns the number of classes wrapped.
+int madeira_metal_gate_install(void);
+
+// DXMT present counter (winemetal_unix.c) — for SwiftUI FPS overlay
+#include <stdint.h>
+uint64_t madeira_get_present_count(void);
+// DXMT presents plus OpenGL presents (Winios/WiniosGL.m)
+uint64_t madeira_frame_count(void);
+// madeira_frame_count without the frames hidden desktop windows present (Winios.m): the FPS readouts
+uint64_t madeira_shown_frame_count(void);
+// Frame intervals (µs, oldest first) of the last window_ms, for the overlay's graph and 1% figures (Winios.m)
+int madeira_frame_times_us(uint32_t *out, int max, uint32_t window_ms, uint32_t *since_last_us);
+// ml1174: GPU busy time for the performance overlay (winemetal_unix.c). While
+// enabled, each committed command buffer adds its GPU time (union) on completion.
+void madeira_gpu_meter_enable(int on);
+/// ml2021: swap tier figures for the performance overlay (virtual_ios.c): file-backed MB,
+/// MB served from the donor pool, the pool's registered size, takes the guard refused.
+void madeira_swap_overlay_stats(unsigned long long *file_mb, unsigned long long *donor_mb, unsigned long long *donor_pool_mb,
+                                unsigned long long *donor_guarded);
+double madeira_gpu_meter_busy_seconds(void);
+uint64_t madeira_gpu_meter_cmdbufs(void);
+// ml1098: ask the D3D12 runtime to capture the next N frames (winemetal_unix.c)
+void madeira_capture_request(int frames);
+// ml1133: ECO switch (ntdll unix sync.c). 1 = every guest thread drops to a
+// low QoS class (efficiency cores, lower clocks) to save the SoC burst budget.
+void madeira_set_eco(int on);
+int madeira_get_eco(void);
+// ml1136: live GPU encoder-sync mode (winemetal_unix.c): 1, 5, 6; 7 = mode 0 (no fences).
+// The D3D12 runtime applies it at the next Present, for lists that start after that.
+void madeira_set_fence_mode(int mode);
+
+// DXMT vsync-lock toggle (winemetal_unix.c) — 1 = pace presents to 60
+// via afterMinimumDuration, 0 = free-run to display max (120 ProMotion,
+// requires CADisableMinimumFrameDurationOnPhone in Info.plist).
+// Read per present; safe to flip live mid-game.
+void madeira_set_vsync_locked(int locked);
+int madeira_get_vsync_locked(void);
+
+// ml1050: what the PANEL can do and what we asked it for, published from
+// Swift (only UIKit knows) so the native [frame] line can print the
+// quantisation grid every present snaps to. panel_hz = the display's own
+// maximum, intent_hz = the CADisplayLink rate currently requested (0 = no
+// intent armed). Both are diagnostics; nothing branches on them.
+// Defined by DXMT from willfaust/dxmt#1 on; IOSDisplayShim.m carries a weak
+// no-op fallback, so the app links and runs against main's DXMT too.
+void madeira_set_display_max_fps(int panel_hz, int intent_hz);
+// 1 when DXMT's own madeira_set_display_max_fps (and with it the 30 FPS cap,
+// vsync mode 3) is linked; valid after the first madeira_set_display_max_fps call.
+int madeira_dxmt_has_display_pacing(void);
+// 1 when DXMT has the 40 FPS cap (vsync mode 4). Defined by DXMT; IOSDisplayShim.m
+// carries a weak fallback that returns 0, so the app links against a DXMT without it.
+int madeira_dxmt_has_40_cap(void);
+
+/* ml526: startup phase timeline (Winios.m) */
+void winios_phase(const char *name);
+
+/* madeira-d3d12: M1 shader-converter canary, compiled into libdxmt.
+ * Returns the number of failed checks; 0 means the gate passed. Output goes to
+ * stderr, which is already captured into madeira-log.txt. */
+int madeira_d3d12_canary_run(const char *fixture_dir, const char *dylib_path,
+                             void (*sink)(const char *));
+/* Same run, but also writes the full per-check transcript to log_path, which is
+ * how the in-app detail is captured: stderr is not redirected into
+ * madeira-log.txt until later in startup. */
+int madeira_d3d12_canary_run_log(const char *fixture_dir, const char *dylib_path,
+                                 void (*sink)(const char *), const char *log_path,
+                                 const char *build_id);
+
+/* PhonePointer.m: opt-in iPhone pointer experiments (env.MADEIRA_PHONE_HOVER,
+ * env.MADEIRA_PHONE_IPAD_IDIOM). Setup runs in MadeiraApp.init; the status says
+ * what was applied, for the [hwinput] log. */
+void madeira_phone_pointer_setup(void);
+const char *madeira_phone_pointer_status(void);
