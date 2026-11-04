@@ -5,7 +5,7 @@ name: Runner probe
 on:
   workflow_dispatch:
   push:
-    branches: ['claude/**']
+    branches: ['claude/**', main]
     paths: ['.github/workflows/runner-probe.yml']
 
 permissions:
@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [macos-latest, macos-15]
+        image: [macos-27, macos-26-arm64, macos-latest]
     runs-on: ${{ matrix.image }}
     timeout-minutes: 10
     steps:
