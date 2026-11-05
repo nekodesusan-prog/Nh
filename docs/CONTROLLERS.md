@@ -73,8 +73,11 @@ controls** (`docs/LIBRARY.md`). Either one lists:
   phones and tablets, and it keeps clear of the top bar. It is offered only while
   touch XInput is enabled, since its buttons are controller mappings.
 - The user's own layouts, **Custom Layout 1**, **Custom Layout 2**, ...
-- **Create new layout**, which adds the next free "Custom Layout N" with no
-  controls and opens the editor on it.
+- **Create new layout**, which adds the next free "Custom Layout N" as a copy
+  of the controls on screen (the built-in controller layout when there are
+  none) and opens the editor on it. The editor's bar has labelled **Grid**,
+  **Haptics**, **Add** and **Done** buttons; a layout with no controls shows a
+  hint to tap Add.
 - **Delete** for the active custom layout (confirmed first). The deleted
   layout's controls are replaced by the built-in, when it is available.
 

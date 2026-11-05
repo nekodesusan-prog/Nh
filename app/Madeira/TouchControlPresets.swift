@@ -486,22 +486,32 @@ final class ControlPresetsModel: ObservableObject {
         return true
     }
 
-    /// "Create new layout": an empty custom layout, made active, opened in the editor.
+    /// "Create new layout": a new custom layout, made active and opened in the
+    /// editor. It starts as a copy of the controls on screen (the controller
+    /// layout, usually), so the editor never opens on a blank screen: a layout
+    /// created empty was saved with no controls at all and left nothing to press.
+    /// With nothing on screen it starts from the built-in controller layout.
     @discardableResult func createLayout() -> Bool {
         guard !readOnly else { return false }
+        let m = TouchControlsModel.shared
+        var start = m.controls
+        if start.isEmpty, Self.touchPad, let xbox = store.preset(ControlPresetLayout.xboxID) {
+            start = ControlPresetStore.layout(of: xbox, screen: Self.currentScreen())
+        }
+        // Fresh identities: the copy is a layout of its own.
+        start = start.map { var c = $0; c.id = UUID(); return c }
+        let zones = GestureZonesModel.shared.zones
         var s = store
-        guard case .created(let id) = s.save(name: s.nextCustomName(), controls: []) else { return false }
+        guard case .created(let id) = s.save(name: s.nextCustomName(), controls: start, zones: zones) else { return false }
         store = s
         persist()
-        let m = TouchControlsModel.shared
         m.selected = nil
-        m.controls = []
+        m.controls = start
         GestureZonesModel.shared.selected = nil
-        GestureZonesModel.shared.zones = []
         m.layoutID = id
         m.visible = true
         m.editing = true
-        log("created custom layout")
+        log("created custom layout controls=\(start.count)")
         return true
     }
 
@@ -547,7 +557,7 @@ final class ControlPresetsModel: ObservableObject {
 // MARK: - Layout menu (landscape overlay, library session menu)
 
 /// The layout menu: the controller built-in, the user's custom layouts,
-/// "Create new layout" (opens the editor on an empty layout) and deleting the
+/// "Create new layout" (opens the editor on a copy of the controls on screen) and deleting the
 /// active custom layout. Shown only while touch controls are on. `.glass` is
 /// the overlay's round top-bar button; `.row` is a labelled row of the library
 /// session's Session menu.

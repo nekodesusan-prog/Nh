@@ -4327,6 +4327,7 @@ struct TouchControlsOverlay: View {
                         }
                         controls(geo.size, session: session)
                     }
+                    emptyHint
                     if session && !m.editing { LibraryHUD() } else { topBar }
                     if m.editing, let i = m.index(of: m.selected) {
                         MappingPanel(control: m.controls[i], screen: geo.size)
@@ -4454,15 +4455,17 @@ struct TouchControlsOverlay: View {
                 }
             }
             if m.editing {
-                glassButton(m.snapToGrid ? "circle.grid.2x2.fill" : "circle.grid.2x2") {
+                // As in BCD's editor: the bar's buttons say what they do.
+                glassPill("Grid", m.snapToGrid ? "circle.grid.2x2.fill" : "circle.grid.2x2", on: m.snapToGrid) {
                     m.snapToGrid.toggle()
                 }
                 .transition(.opacity.combined(with: .scale))
-                glassButton(m.hapticsEnabled ? "iphone.radiowaves.left.and.right" : "iphone.slash") {
+                glassPill("Haptics", m.hapticsEnabled ? "iphone.radiowaves.left.and.right" : "iphone.slash",
+                          on: m.hapticsEnabled) {
                     m.hapticsEnabled.toggle()
                 }
                 .transition(.opacity.combined(with: .scale))
-                glassButton("plus") {
+                glassPill("Add", "plus") {
                     var c = TouchControl()
                     // Stagger, so repeated adds do not stack invisibly.
                     c.nx = 0.5 + Double(m.controls.count % 3) * 0.06
@@ -4483,6 +4486,43 @@ struct TouchControlsOverlay: View {
         }
         .padding(.top, 10)
         .animation(.easeInOut(duration: 0.22), value: m.editing)
+    }
+
+    /// While editing a layout with no controls: what to do, so the editor never
+    /// shows a blank screen with nothing to press.
+    @ViewBuilder private var emptyHint: some View {
+        if m.editing && m.controls.isEmpty {
+            Text("No buttons yet. Tap Add at the top to place one, then tap it to choose what it does.")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 18).padding(.vertical, 12)
+                .background(GlassShape(cornerRadius: 16))
+                .frame(maxWidth: 420)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(false)
+        }
+    }
+
+    /// A labelled top-bar button for the editor: a symbol and a word.
+    private func glassPill(_ title: String, _ system: String, on: Bool = false,
+                           _ action: @escaping () -> Void) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            withAnimation(.easeInOut(duration: 0.22)) { action() }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: system).font(.system(size: 15, weight: .semibold))
+                Text(title).font(.system(size: 15, weight: .semibold))
+            }
+            .foregroundStyle(.white.opacity(on || title == "Add" ? 1.0 : 0.6))
+            .padding(.horizontal, 14)
+            .frame(height: 44)
+            .background(GlassShape(capsule: true))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
     }
 
     /// Pinch anywhere scales the SELECTED control. With nothing selected it does
