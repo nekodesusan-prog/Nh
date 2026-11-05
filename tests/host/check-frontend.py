@@ -651,12 +651,30 @@ check('GameSurfaceLayout.rect(' in content and 'GameSurfaceLayout.map(' in conte
 check('if touchPointerMode { touchModeBegan(touches); return }' in content, 'the game view handles the Touch pointer mode')
 check('TouchControlsModel.diameter(control)' in content and 'library.opacity' in content,
       "touch controls follow the session's size and opacity")
-# The Opacity slider: on iOS 26 a button's own .opacity inside the GlassEffectContainer
-# left the glass as it was, so the opacity goes on the container (and the pre-26 group).
+# The Opacity slider fades the whole set of controls, not each button (a button's own
+# .opacity left iOS 26 glass as it was). As in BCD, the controls sit in a plain ZStack,
+# not a GlassEffectContainer, and nothing in the layer animates.
 overlay = block(content, 'private func controls(_ screen: CGSize, session: Bool)')
 check('let opacity = session && !m.editing ? library.opacity : 1' in overlay and '.opacity(opacity)' in overlay
-      and 'TouchControlButton(control: c, screen: screen)\n        }' in overlay,
-      'the Opacity slider fades the whole GlassEffectContainer, not each button inside it')
+      and 'TouchControlButton(control: c, screen: screen)\n            }' in overlay
+      and 'GlassEffectContainer(' not in overlay and '.transaction { $0.animation = nil }' in overlay,
+      'the Opacity slider fades the whole set of controls, drawn without a glass container or animation')
+# Touches, as in BCD: every control in play takes its fingers through a UIKit surface of
+# its own (TouchPadSurface for controller controls, TouchKeySurface for the rest); the
+# SwiftUI drag is the editor's only.
+touch_button = block(content, 'struct TouchControlButton: View')
+gamepad_src = (root / 'app/Madeira/TouchGamepad.swift').read_text()
+check('TouchPadSurface(control: control.id, action: action)' in touch_button
+      and 'TouchKeySurface(action: control.action, diameter: diameter)' in touch_button
+      and 'including: m.editing ? .all : .subviews' in touch_button
+      and 'winios_post_key' not in touch_button
+      and 'final class TouchKeyView: UIView' in gamepad_src and 'override func touchesCancelled' in gamepad_src
+      and 'UIApplication.willResignActiveNotification' in gamepad_src,
+      'touch controls: each control has its own UIKit touch surface; the drag only edits')
+# The controls window takes a touch over a wide control's whole shape (shoulders, Start/Select).
+hits = block(content, 'func hitsInteractive(')
+check('case .some(.wide), .some(.capsule):' in hits and 'Self.size(c)' in hits,
+      'the controls window takes touches over the whole drawn shape of wide controls')
 # Button style: Glass or Solid (TouchControlStyle), in the in-game menu and Settings › Appearance.
 button = block(content, 'struct TouchControlButton: View')
 check('@AppStorage(TouchControlStyle.key) private var style = "glass"' in button

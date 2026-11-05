@@ -1029,8 +1029,8 @@ struct JoystickFace: View {
         }
         .frame(width: d, height: d)
         // The ring, glyph and knob are the glass's content, not siblings of it:
-        // an overlay stick sits in the controls' GlassEffectContainer, which
-        // composites every glass over its siblings and blurred the knob.
+        // inside a GlassEffectContainer every glass is composited over its
+        // siblings, which blurred the knob.
         if glass {
             face.glassFace(GlassShape(circle: true))
         } else {
@@ -4212,10 +4212,17 @@ final class TouchControlsModel: ObservableObject {
                           width: barW + 20, height: 68).contains(p) { return true }
         guard visible else { return false }
         for c in controls {
-            let r = Self.diameter(c) / 2
             let cx = CGFloat(c.nx) * bounds.width
             let cy = CGFloat(c.ny) * bounds.height
-            if hypot(p.x - cx, p.y - cy) <= r { return true }
+            switch c.action.padFace {
+            case .some(.wide), .some(.capsule):
+                // LB/RB/LT/RT and View/Menu are wider than their diameter: the
+                // whole drawn shape takes the touch (TouchPadView fills it).
+                let s = Self.size(c)
+                if abs(p.x - cx) <= s.width / 2, abs(p.y - cy) <= s.height / 2 { return true }
+            default:
+                if hypot(p.x - cx, p.y - cy) <= Self.size(c).width / 2 { return true }
+            }
         }
         return GestureZonesModel.shared.contains(p, in: bounds)
     }
@@ -4362,31 +4369,24 @@ struct TouchControlsOverlay: View {
         return area
     }
 
-    /// Every control in ONE GlassEffectContainer: on iOS 26 the system merges
-    /// glass shapes that come within `spacing` of each other, so a D-pad cross
-    /// or a face diamond pinched tight reads as one piece of glass and a button
-    /// dragged next to another flows into it. 12 pt: the built-in layout's
-    /// neighbours sit further apart than that, so nothing merges until it is
-    /// moved almost touching. Before 26 the same views stack as plain material.
+    /// The controls as BCD draws them over a game: each control is its own view
+    /// with its own UIKit touch surface (TouchPadSurface or TouchKeySurface), in one
+    /// plain ZStack. No GlassEffectContainer around them: it renders every child's
+    /// glass as one layer of its own, and the touch surfaces have to sit exactly
+    /// where each control is drawn. Nothing here animates: SwiftUI animations over a
+    /// running game have crashed the app before (ml890).
     @ViewBuilder private func controls(_ screen: CGSize, session: Bool) -> some View {
-        // A library session's Control opacity; full while editing. The opacity
-        // goes on the whole group, not on each button: inside a
-        // GlassEffectContainer the glass is rendered by the container as one
-        // layer over its children, so a button's own .opacity faded its label and
-        // left the glass as it was (the Opacity slider seemed to do nothing).
+        // A library session's Control opacity; full while editing. Without a glass
+        // container every control's glass is its own, so the group fades as a whole.
         let opacity = session && !m.editing ? library.opacity : 1
-        let buttons = ForEach(m.controls) { c in
-            TouchControlButton(control: c, screen: screen)
-        }
-        if #available(iOS 26.0, *) {
-            GlassEffectContainer(spacing: 12) {
-                ZStack { buttons }
-                    .frame(width: screen.width, height: screen.height, alignment: .topLeading)
+        ZStack(alignment: .topLeading) {
+            ForEach(m.controls) { c in
+                TouchControlButton(control: c, screen: screen)
             }
-            .opacity(opacity)
-        } else {
-            buttons.opacity(opacity)
         }
+        .frame(width: screen.width, height: screen.height, alignment: .topLeading)
+        .opacity(opacity)
+        .transaction { $0.animation = nil }
     }
 
     private func configureGamepad(landscape: Bool) {
@@ -4703,8 +4703,7 @@ struct TouchControlButton: View {
         // whole process with a SwiftUI trap on com.apple.SwiftUI.AsyncRenderer
         // (DisplayList.ViewUpdater.ViewCache.commitAsyncValues) while this
         // glass control animated its press; the state change now applies at once.
-        // ml646: the springy knob, same curve as the portrait pad overlay.
-        .animation(.spring(response: 0.22, dampingFraction: 0.58), value: stickDir)
+        // No knob animation either (BCD): the face follows the finger at once.
         .overlay(alignment: .topTrailing) {
             if isSelected && control.locked != true {
                 Button {
@@ -4722,119 +4721,63 @@ struct TouchControlButton: View {
                 .offset(x: 8, y: -8)
             }
         }
+        // Play: every control takes its fingers through a UIKit surface of its own,
+        // as in BCD. A controller control feeds the touch gamepad (TouchPadSurface);
+        // every other control (keys, mouse buttons, the keyboard, key sticks) its
+        // TouchKeySurface. Each finger is independent of the others, a lift or a
+        // cancel always releases, and nothing is left held.
         .overlay {
-            if let action = control.action.padName, !m.editing {
-                TouchPadSurface(control: control.id, action: action) { vector, down in
-                    padVector = vector; isDown = down
+            if !m.editing {
+                if let action = control.action.padName {
+                    TouchPadSurface(control: control.id, action: action) { vector, down in
+                        padVector = vector; isDown = down
+                    }
+                } else {
+                    TouchKeySurface(action: control.action, diameter: diameter) { down, direction in
+                        isDown = down; stickDir = direction
+                    }
                 }
             }
         }
-        .onDisappear { if control.action.isPad { padVector = .zero; isDown = false } }
-        .onChange(of: m.editing) { _, _ in if control.action.isPad { padVector = .zero; isDown = false } }
-        .onChange(of: screen) { _, _ in if control.action.isPad { padVector = .zero; isDown = false } }
-        .onChange(of: control.action) { old, new in
-            if old.isPad || new.isPad { padVector = .zero; isDown = false }
-        }
+        .onDisappear { rest() }
+        .onChange(of: m.editing) { _, _ in rest() }
+        .onChange(of: screen) { _, _ in rest() }
+        .onChange(of: control.action) { _, _ in rest() }
         .position(x: CGFloat(control.nx) * screen.width,
                   y: CGFloat(control.ny) * screen.height)
+        // Editing only: touch a control to select it, drag it to move it.
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { v in
-                    if m.editing {
-                        m.selected = control.id
-                        guard control.locked != true, let i = m.index(of: control.id) else { return }
-                        if dragBase == nil { dragBase = CGPoint(x: control.nx, y: control.ny) }
-                        let b = dragBase ?? .zero
-                        m.controls[i].nx = min(max(b.x + Double(v.translation.width  / screen.width),  0.03), 0.97)
-                        m.controls[i].ny = min(max(b.y + Double(v.translation.height / screen.height), 0.03), 0.97)
-                    } else if let q = control.action.stickKeys {
-                        isDown = true
-                        applyStick(snap(v.translation), q)
-                    } else if !isDown {
-                        isDown = true
-                        press(true)
-                    }
+                    guard m.editing else { return }
+                    m.selected = control.id
+                    guard control.locked != true, let i = m.index(of: control.id) else { return }
+                    if dragBase == nil { dragBase = CGPoint(x: control.nx, y: control.ny) }
+                    let b = dragBase ?? .zero
+                    m.controls[i].nx = min(max(b.x + Double(v.translation.width  / screen.width),  0.03), 0.97)
+                    m.controls[i].ny = min(max(b.y + Double(v.translation.height / screen.height), 0.03), 0.97)
                 }
                 .onEnded { _ in
                     dragBase = nil
-                    if m.editing {
-                        guard let i = m.index(of: control.id) else { return }
-                        if m.snapToGrid {
-                            let step: Double = 0.02
-                            let snappedX = (m.controls[i].nx / step).rounded() * step
-                            let snappedY = (m.controls[i].ny / step).rounded() * step
-                            m.controls[i].nx = min(max(snappedX, 0.03), 0.97)
-                            m.controls[i].ny = min(max(snappedY, 0.03), 0.97)
-                        }
-                    } else if let q = control.action.stickKeys {
-                        applyStick(-1, q)          // release every held direction
-                        isDown = false
-                    } else if isDown {
-                        isDown = false
-                        press(false)
+                    guard m.editing, let i = m.index(of: control.id) else { return }
+                    if m.snapToGrid {
+                        let step: Double = 0.02
+                        let snappedX = (m.controls[i].nx / step).rounded() * step
+                        let snappedY = (m.controls[i].ny / step).rounded() * step
+                        m.controls[i].nx = min(max(snappedX, 0.03), 0.97)
+                        m.controls[i].ny = min(max(snappedY, 0.03), 0.97)
                     }
                 },
-            including: control.action.isPad && !m.editing ? .subviews : .all
+            including: m.editing ? .all : .subviews
         )
     }
 
-    /// 8-way snap. Screen y grows downward, so measure clockwise from "up".
-    private func snap(_ t: CGSize) -> Int {
-        let d = (t.width * t.width + t.height * t.height).squareRoot()
-        if d < diameter * 0.22 { return -1 }        // deadzone scales with the control
-        var a = atan2(t.width, -t.height) * 180 / .pi
-        if a < 0 { a += 360 }
-        return Int((a + 22.5) / 45.0) % 8
-    }
-
-    private func stickKeys(_ d: Int, _ q: [Int32]) -> [Int32] {
-        switch d {
-        case 0: return [q[0]]
-        case 1: return [q[0], q[1]]
-        case 2: return [q[1]]
-        case 3: return [q[2], q[1]]
-        case 4: return [q[2]]
-        case 5: return [q[2], q[3]]
-        case 6: return [q[3]]
-        case 7: return [q[0], q[3]]
-        default: return []
-        }
-    }
-
-    /// Release what is no longer held, press what newly is. A blanket
-    /// release/re-press would make a held direction stutter as the thumb
-    /// wanders inside one sector.
-    private func applyStick(_ next: Int, _ q: [Int32]) {
-        guard next != stickDir else { return }
-        let old = Set(stickKeys(stickDir, q)), new = Set(stickKeys(next, q))
-        for vk in old.subtracting(new) { winios_post_key(vk, 0) }
-        for vk in new.subtracting(old) { winios_post_key(vk, 1) }
-        if stickDir == -1, next != -1, TouchControlsModel.shared.hapticsEnabled {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        }
-        stickDir = next
-    }
-
-    /// Haptic on the DOWN edge only — a held movement key would otherwise buzz
-    /// continuously for as long as you walk.
-    private func press(_ down: Bool) {
-        if down && TouchControlsModel.shared.hapticsEnabled {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        }
-        switch control.action {
-        case .key(let vk):
-            winios_post_key(vk, down ? 1 : 0)
-        case .mouseLeft:
-            winios_pointer(0, 0, down ? 0x0002 : 0x0004, 0)   // LEFTDOWN / LEFTUP
-        case .mouseRight:
-            winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)   // RIGHTDOWN / RIGHTUP
-        case .keyboardToggle:
-            if down { MetalBackedView.toggleKeyboard() }
-        case .none, .joystickWASD, .joystickArrows:
-            break                                              // sticks drive themselves
-        case .pad:
-            break     // TouchPadSurface owns pad presses and cancellation.
-        }
+    /// The face at rest. The surfaces release what they held themselves
+    /// (TouchPadView.releaseAll, TouchKeyView.finish).
+    private func rest() {
+        isDown = false
+        stickDir = -1
+        padVector = .zero
     }
 }
 
