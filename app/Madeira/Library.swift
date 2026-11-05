@@ -3945,6 +3945,7 @@ struct LibraryDetail: View {
     var play: (LibraryEntry) -> Void
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var model = LibraryModel.shared
+    @Environment(\.scenePhase) private var scenePhase
     @State private var importCover = false
     /// madeira-bcd: this game's own switches as the fork stores them (reloadBCD).
     @State private var bcd = BCDGameValues()
@@ -4625,6 +4626,11 @@ struct LibraryDetail: View {
             Button("Remove", role: .destructive) { leaving = true; model.remove(entry.id); dismiss() }
         }
         .onDisappear { if !leaving { model.save(entry) } }
+        // The page saves when it closes, which never happens when Madeira is closed
+        // from the app switcher with it open: the Display page's resolution and FPS
+        // changes were lost. Leaving the app saves them too (the library writer
+        // finishes the write before the app suspends).
+        .onChange(of: scenePhase) { _, phase in if phase != .active, !leaving { model.save(entry) } }
         .onReceive(LibraryController.shared.commands) { command in
             guard !leaving, !findCover, !importCover, !remove, !confirmReset else { return }
             if command == "back" {
