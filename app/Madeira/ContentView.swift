@@ -4694,6 +4694,10 @@ struct TouchControlButton: View {
             }
         }
         .frame(width: size.width, height: size.height)
+        // The control's touch area is its drawn shape, said outright: SwiftUI must
+        // never work it out from the glass, which iOS 26 draws apart from the view
+        // (the editor's select-and-drag went dead with it).
+        .contentShape(outline)
         .overlay(outline.stroke(.white.opacity(isSelected ? 0.95
                                                : (isStick ? 0 : 0.28)),
                                 lineWidth: isSelected ? 2 : 1))
