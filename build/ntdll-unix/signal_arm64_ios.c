@@ -9426,6 +9426,105 @@ static inline void ios_fixup_x18_for_return( ucontext_t *context );
  * OutputDebugString we never see). Log every exception dispatched to the
  * guest: code+address+params. DBG_PRINTEXCEPTION carries the game's own
  * debug string — print it. 0xE06D7363 = MSVC C++ throw. */
+/* Madeira: a Delphi program's exception (0x0EEDFADE; ExceptionInformation[1] is
+ * the Exception object) said only "Unhandled exception 0x0eedfade": the class
+ * and message the game would have shown were never in the log (a LiveMaker
+ * visual novel died on Start every time with nothing else to go on). Read them
+ * from guest memory: the object's VMT (offset 0) gives the class name (a short
+ * string at vmtClassName: -44 before Delphi 2009, -56 after, -112 in 64-bit
+ * code) and FMessage (offset 4, or 8 in 64-bit code) a string whose length
+ * sits 4 bytes before its text: UTF-16 from Delphi 2009 on, the ANSI code page
+ * before. Every read goes through virtual_uninterrupted_read_memory, so a bad
+ * pointer prints nothing instead of faulting. Log tag [exc-delphi]. */
+static ULONG_PTR ios_delphi_ptr( ULONG_PTR addr, int wide, ULONG_PTR base, ULONG_PTR *out )
+{
+    ULONG v32 = 0;
+    ULONG64 v64 = 0;
+
+    if (wide)
+    {
+        if (virtual_uninterrupted_read_memory( (void *)addr, &v64, 8 ) != 8) return 0;
+        *out = (ULONG_PTR)v64;
+    }
+    else
+    {
+        if (virtual_uninterrupted_read_memory( (void *)addr, &v32, 4 ) != 4) return 0;
+        *out = v32 ? base + v32 : 0;
+    }
+    return *out != 0;
+}
+
+static void ios_log_delphi_exception( const EXCEPTION_RECORD *rec )
+{
+    ULONG_PTR obj = rec->ExceptionInformation[1], base = 0, vmt, name_ptr, msg;
+    int wide = obj > 0xffffffffULL, len_ok = 0;
+    static const int name_offs32[] = { -56, -44 };
+    unsigned char sname[64];
+    char cls[64] = "?", text[600];
+    unsigned char raw[512];
+    LONG len = 0;
+    size_t i, n, o = 0;
+
+    if (!wide)
+    {
+        base = ios_wow_base();
+        if (!base) base = (ULONG_PTR)rec->ExceptionAddress & ~(ULONG_PTR)0xffffffff;
+        obj += base;
+    }
+    if (!ios_delphi_ptr( obj, wide, base, &vmt )) return;
+
+    for (i = 0; i < (wide ? 1u : 2u); i++)
+    {
+        int off = wide ? -112 : name_offs32[i];
+        if (!ios_delphi_ptr( vmt + off, wide, base, &name_ptr )) continue;
+        if (virtual_uninterrupted_read_memory( (void *)name_ptr, sname, sizeof(sname) ) < 2) continue;
+        if (!sname[0] || sname[0] > 62) continue;
+        for (n = 1; n <= sname[0]; n++) if (sname[n] < 0x20 || sname[n] > 0x7e) break;
+        if (n <= sname[0]) continue;
+        memcpy( cls, sname + 1, sname[0] );
+        cls[sname[0]] = 0;
+        break;
+    }
+
+    text[0] = 0;
+    if (ios_delphi_ptr( obj + (wide ? 8 : 4), wide, base, &msg ) &&
+        virtual_uninterrupted_read_memory( (void *)(msg - 4), &len, 4 ) == 4 && len > 0)
+    {
+        size_t got = virtual_uninterrupted_read_memory( (void *)msg, raw, sizeof(raw) );
+        /* Delphi 2009+ strings carry their element size (2: UTF-16, 1: ANSI) 10 bytes
+         * before the text (14 in 64-bit code); older ANSI strings have no such field,
+         * so anything else falls back to looking at the first character. */
+        USHORT elem = 0;
+        int utf16;
+        virtual_uninterrupted_read_memory( (void *)(msg - (wide ? 14 : 10)), &elem, 2 );
+        if (elem == 2 || elem == 1) utf16 = elem == 2;
+        else utf16 = got >= 2 && raw[0] && !raw[1];
+        len_ok = 1;
+        if (utf16)
+        {
+            for (i = 0; i + 1 < got && i / 2 < (size_t)len && o < sizeof(text) - 4; i += 2)
+            {
+                unsigned c = raw[i] | (raw[i + 1] << 8);
+                if (c < 0x20) c = ' ';
+                if (c < 0x80) text[o++] = (char)c;
+                else if (c < 0x800) { text[o++] = 0xc0 | (c >> 6); text[o++] = 0x80 | (c & 0x3f); }
+                else { text[o++] = 0xe0 | (c >> 12); text[o++] = 0x80 | ((c >> 6) & 0x3f); text[o++] = 0x80 | (c & 0x3f); }
+            }
+        }
+        else
+        {
+            for (i = 0; i < got && i < (size_t)len && o < sizeof(text) - 5; i++)
+            {
+                if (raw[i] >= 0x20 && raw[i] < 0x7f) text[o++] = (char)raw[i];
+                else o += snprintf( text + o, sizeof(text) - o, "\\x%02x", raw[i] );
+            }
+        }
+        text[o] = 0;
+    }
+    dprintf( 2, "[exc-delphi] class=%s message=%s%s%s\n", cls,
+             len_ok ? "\"" : "(unreadable)", text, len_ok ? "\"" : "" );
+}
+
 static void ios_log_guest_exception( const char *via, const EXCEPTION_RECORD *rec, ULONG64 pc )
 {
     static volatile int exc_logged = 0;
@@ -9452,6 +9551,8 @@ static void ios_log_guest_exception( const char *via, const EXCEPTION_RECORD *re
         buf[i] = 0;
         dprintf(2, "[exc-disp]   OutputDebugStringW: \"%s\"\n", buf);
     }
+    if (rec->ExceptionCode == 0x0eedfade && rec->NumberParameters >= 2 && rec->ExceptionInformation[1])
+        ios_log_delphi_exception( rec );
 }
 
 static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, CONTEXT *context )
