@@ -1,0 +1,117 @@
+diff --git a/dlls/quartz/filtergraph.c b/dlls/quartz/filtergraph.c
+index 17e5bb1..9d20146 100644
+--- a/dlls/quartz/filtergraph.c
++++ b/dlls/quartz/filtergraph.c
+@@ -151,6 +151,10 @@ struct filter_graph
+ 
+     unsigned int needs_async_run : 1;
+     unsigned int threaded : 1;
++
++    /* Madeira: bumped by every Run, Pause and Stop; StopWhenReady's deferred
++     * Stop only happens while it is unchanged (see wait_pause_cb). */
++    LONG state_change_seq;
+ };
+ 
+ struct enum_filters
+@@ -1888,6 +1892,7 @@ static HRESULT WINAPI MediaControl_Run(IMediaControl *iface)
+     TRACE("graph %p.\n", graph);
+ 
+     EnterCriticalSection(&graph->cs);
++    InterlockedIncrement(&graph->state_change_seq);
+ 
+     if (graph->state == State_Running)
+     {
+@@ -2015,22 +2020,44 @@ static HRESULT WINAPI MediaControl_get_RegFilterCollection(IMediaControl *iface,
+     return S_OK;
+ }
+ 
++struct stop_when_ready
++{
++    IMediaControl *control;
++    LONG seq;
++};
++
++/* Madeira: StopWhenReady stops the graph once it has paused -- unless the
++ * application changed the state itself in the meantime.  An AI6WIN visual
++ * novel calls StopWhenReady (to cue its movie) and then Run before the first
++ * picture arrives; the deferred Stop used to fire after the Run and stop the
++ * movie the game had just started, and the game then waited forever for it
++ * (a black screen, or the last picture held). */
+ static void CALLBACK wait_pause_cb(TP_CALLBACK_INSTANCE *instance, void *context)
+ {
+-    IMediaControl *control = context;
++    struct stop_when_ready *ctx = context;
++    IMediaControl *control = ctx->control;
++    struct filter_graph *graph = impl_from_IMediaControl(control);
+     OAFilterState state;
+     HRESULT hr;
+ 
+     if ((hr = IMediaControl_GetState(control, INFINITE, &state)) != S_OK)
+         ERR("Failed to get paused state, hr %#lx.\n", hr);
+ 
+-    if (FAILED(hr = IMediaControl_Stop(control)))
+-        ERR("Failed to stop, hr %#lx.\n", hr);
++    if (ReadNoFence(&graph->state_change_seq) != ctx->seq)
++    {
++        TRACE("graph %p: the state changed after StopWhenReady; not stopping.\n", graph);
++    }
++    else
++    {
++        if (FAILED(hr = IMediaControl_Stop(control)))
++            ERR("Failed to stop, hr %#lx.\n", hr);
+ 
+-    if ((hr = IMediaControl_GetState(control, INFINITE, &state)) != S_OK)
+-        ERR("Failed to get paused state, hr %#lx.\n", hr);
++        if ((hr = IMediaControl_GetState(control, INFINITE, &state)) != S_OK)
++            ERR("Failed to get paused state, hr %#lx.\n", hr);
++    }
+ 
+     IMediaControl_Release(control);
++    free(ctx);
+ }
+ 
+ static void CALLBACK wait_stop_cb(TP_CALLBACK_INSTANCE *instance, void *context)
+@@ -2058,8 +2085,18 @@ static HRESULT WINAPI MediaControl_StopWhenReady(IMediaControl *iface)
+         return hr;
+     else if (hr == S_FALSE)
+     {
++        struct stop_when_ready *ctx;
++
++        if (!(ctx = malloc(sizeof(*ctx))))
++            return E_OUTOFMEMORY;
++        ctx->control = iface;
++        ctx->seq = ReadNoFence(&graph->state_change_seq);
+         IMediaControl_AddRef(iface);
+-        TrySubmitThreadpoolCallback(wait_pause_cb, iface, NULL);
++        if (!TrySubmitThreadpoolCallback(wait_pause_cb, ctx, NULL))
++        {
++            IMediaControl_Release(iface);
++            free(ctx);
++        }
+         return S_FALSE;
+     }
+ 
+@@ -5069,6 +5106,7 @@ static HRESULT WINAPI MediaFilter_Stop(IMediaFilter *iface)
+     TRACE("graph %p.\n", graph);
+ 
+     EnterCriticalSection(&graph->cs);
++    InterlockedIncrement(&graph->state_change_seq);
+ 
+     if (graph->state == State_Stopped)
+     {
+@@ -5121,6 +5159,7 @@ static HRESULT WINAPI MediaFilter_Pause(IMediaFilter *iface)
+     TRACE("graph %p.\n", graph);
+ 
+     EnterCriticalSection(&graph->cs);
++    InterlockedIncrement(&graph->state_change_seq);
+ 
+     if (graph->state == State_Paused)
+     {
+@@ -5172,6 +5211,7 @@ static HRESULT WINAPI MediaFilter_Run(IMediaFilter *iface, REFERENCE_TIME start)
+     TRACE("graph %p, start %s.\n", graph, debugstr_time(start));
+ 
+     EnterCriticalSection(&graph->cs);
++    InterlockedIncrement(&graph->state_change_seq);
+ 
+     if (graph->state == State_Running)
+     {
