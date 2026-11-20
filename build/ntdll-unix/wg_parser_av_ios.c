@@ -100,6 +100,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -287,6 +288,30 @@ static void mav_configure( int video_allowed, const struct mav_video_backend *vi
     mav_vbackend = video;
     mav_abackend = audio;
     mav_native_pix = native ? native : MAV_PIX_NV12;
+}
+
+/* ---- [wg-time]: how long a connect, a seek and the first picture after one
+ * take, one line each (not deduplicated, bounded), so a hitch when a game
+ * starts or loops a movie can be measured from a device log. ---- */
+static double mav_now(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static void mav_time_log( const char *fmt, ... ) __attribute__((format(printf, 1, 2)));
+static void mav_time_log( const char *fmt, ... )
+{
+    static int lines;
+    char line[256];
+    va_list args;
+
+    if (__atomic_add_fetch( &lines, 1, __ATOMIC_RELAXED ) > 400) return;
+    va_start( args, fmt );
+    vsnprintf( line, sizeof(line), fmt, args );
+    va_end( args );
+    dprintf( 2, "[wg-time] %s\n", line );
 }
 
 /* ---- MPEG-1/2 video on libavcodec ----
@@ -647,6 +672,10 @@ struct mav_parser
     int output_compressed;
     uint64_t file_size;
     uint64_t pos;               /* next byte offset the AVIO callback reads */
+    uint64_t bytes_read;        /* through the read protocol, for the [wg-time] lines */
+    unsigned int read_requests;
+    double mark;                /* when the last connect or seek began (seconds) */
+    int first_picture_pending;  /* log the time to the first picture after mark */
 
     AVIOContext *avio;
     AVFormatContext *fmt;
@@ -704,6 +733,8 @@ static int mav_avio_read( void *opaque, uint8_t *dest, int size )
     if (result > 0)
     {
         p->pos += result;
+        p->bytes_read += result;
+        p->read_requests++;
         return result;
     }
     return result ? AVERROR(EIO) : AVERROR_EOF;
@@ -1185,25 +1216,34 @@ static int mav_open_audio( struct mav_parser *p, struct mav_stream *s, AVStream 
  * through the demuxer's own AVIO (and its position put back); 0 if none. */
 static uint32_t mav_mpeg_find_seqhdr( struct mav_parser *p, uint8_t *out, uint32_t out_size )
 {
-    const uint32_t window = 256 * 1024;
+    const uint32_t window = 256 * 1024, step = 16 * 1024;
     int64_t pos = avio_tell( p->fmt->pb );
-    uint32_t i, len = 0;
+    uint32_t i, have = 0, scanned = 0, len = 0;
     uint8_t *buf;
-    int got;
+    int got, found = 0;
 
     if (pos < 0 || !(buf = av_malloc( window ))) return 0;
-    if (avio_seek( p->fmt->pb, 0, SEEK_SET ) >= 0 && (got = avio_read( p->fmt->pb, buf, window )) > 0)
+    /* in small steps: the header is normally in the first few KB, and every
+     * byte comes through the game's own reader */
+    if (avio_seek( p->fmt->pb, 0, SEEK_SET ) >= 0)
     {
-        for (i = 0; i + 12 <= (uint32_t)got; i++)
+        while (!found && have < window && (got = avio_read( p->fmt->pb, buf + have, step )) > 0)
         {
-            uint32_t n;
-            if (buf[i] || buf[i + 1] || buf[i + 2] != 1 || buf[i + 3] != 0xb3) continue;
-            if ((n = mav_mpeg_seqhdr_len( buf + i, got - i )) && n <= out_size)
+            have += got;
+            for (i = scanned; i + 4 <= have; i++)
             {
-                memcpy( out, buf + i, n );
-                len = n;
+                uint32_t n;
+                if (buf[i] || buf[i + 1] || buf[i + 2] != 1 || buf[i + 3] != 0xb3) continue;
+                if (have - i < 600 && have < window) break;   /* read on: the header may be cut */
+                found = 1;
+                if ((n = mav_mpeg_seqhdr_len( buf + i, have - i )) && n <= out_size)
+                {
+                    memcpy( out, buf + i, n );
+                    len = n;
+                }
+                break;
             }
-            break;
+            if (!found) scanned = i;
         }
     }
     avio_seek( p->fmt->pb, pos, SEEK_SET );
@@ -1468,6 +1508,8 @@ static int mav_connect( struct mav_parser *p, uint64_t file_size )
     }
     p->file_size = file_size;
     p->pos = 0;
+    p->bytes_read = p->read_requests = 0;
+    p->mark = mav_now();
     mav_set_connected( p, 1 );
     if ((status = mav_connect_locked( p )))
     {
@@ -1475,6 +1517,10 @@ static int mav_connect( struct mav_parser *p, uint64_t file_size )
         /* like wg_parser.c: a failed connect ends the read protocol */
         mav_set_connected( p, 0 );
     }
+    mav_time_log( "connect %s compressed_out=%d: %.1f ms, %llu KB in %u reads (file %llu KB)",
+                  status ? "refused" : "ok", p->output_compressed, (mav_now() - p->mark) * 1000.0,
+                  (unsigned long long)(p->bytes_read >> 10), p->read_requests, (unsigned long long)(file_size >> 10) );
+    if (!status) p->first_picture_pending = 1;
     pthread_mutex_unlock( &p->lock );
     return status;
 }
@@ -2214,6 +2260,12 @@ static int mav_video_emit( struct mav_parser *p, struct mav_stream *s, struct ma
     s->cur.delta = 0;
     s->discontinuity = 0;
     s->has_buffer = 1;
+    if (p->first_picture_pending)
+    {
+        p->first_picture_pending = 0;
+        mav_time_log( "first picture (pts %lld ms) %.1f ms after the connect/seek", (long long)(pts / 10000),
+                      (mav_now() - p->mark) * 1000.0 );
+    }
     return 1;
 }
 
@@ -2372,6 +2424,9 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
          * the PE side's way to start over, so it must not stay failed. */
         p->avio->error = 0;
         p->avio->eof_reached = 0;
+        double t0 = mav_now();
+        uint64_t b0 = p->bytes_read;
+
         if (p->is_mpeg && target <= 10000000)
         {
             /* An MPEG program stream has no index: avformat_seek_file searches by
@@ -2389,6 +2444,10 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
             err = avformat_seek_file( p->fmt, ref->av_index, INT64_MIN, ts, ts, 0 );
             if (err < 0) err = av_seek_frame( p->fmt, ref->av_index, ts, AVSEEK_FLAG_BACKWARD );
         }
+        mav_time_log( "seek to %llu ms: %.1f ms, %llu KB read", (unsigned long long)(start / 10000),
+                      (mav_now() - t0) * 1000.0, (unsigned long long)((p->bytes_read - b0) >> 10) );
+        p->mark = t0;
+        p->first_picture_pending = 1;
         if (err < 0)
         {
             mav_log( "seek to %llums failed (%d)", (unsigned long long)(start / 10000), err );
