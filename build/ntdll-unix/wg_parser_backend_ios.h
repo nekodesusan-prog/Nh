@@ -28,6 +28,8 @@ enum mav_backend_codec
 {
     MAV_BACKEND_H264 = 1,       /* extradata: avcC (ISO/IEC 14496-15), length-prefixed NAL packets */
     MAV_BACKEND_HEVC = 2,       /* extradata: hvcC, length-prefixed NAL packets */
+    MAV_BACKEND_MPEG1 = 3,      /* MPEG-1 video elementary packets (no extradata) */
+    MAV_BACKEND_MPEG2 = 4,      /* MPEG-2 video elementary packets (no extradata) */
     MAV_BACKEND_AAC = 16,       /* extradata: AudioSpecificConfig, one raw access unit per packet */
 };
 

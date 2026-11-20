@@ -107,6 +107,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/intreadwrite.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/mem.h>
 #include <libavutil/samplefmt.h>
@@ -167,6 +168,8 @@ enum mav_codec_kind
     MAV_CODEC_AAC = 3,
     MAV_CODEC_H264 = 4,
     MAV_CODEC_HEVC = 5,
+    MAV_CODEC_MPEG1 = 6,
+    MAV_CODEC_MPEG2 = 7,
 };
 
 struct mav_output
@@ -286,6 +289,206 @@ static void mav_configure( int video_allowed, const struct mav_video_backend *vi
     mav_native_pix = native ? native : MAV_PIX_NV12;
 }
 
+/* ---- MPEG-1/2 video on libavcodec ----
+ * VideoToolbox decodes only H.264/HEVC here, and the movies of older visual
+ * novels are MPEG-1 program streams (AI6WIN's .vsd files: 1024x768 MPEG-1, the
+ * game opened one through DirectShow, got no picture and crashed on it).
+ * libavcodec's mpeg1video/mpeg2video decoders are LGPL and cheap; this backend
+ * gives their pictures to the core in the NV12 layout the backend contract
+ * promises (the chroma planes are interleaved at map time).  Pictures come out
+ * in presentation order with the packet's timestamps; a NULL packet drains
+ * the decoder's held-back picture at the end of the stream. */
+struct mav_lavc_vdec
+{
+    AVCodecContext *ctx;
+    AVPacket *pkt;
+    uint8_t seqhdr[512];        /* the last sequence header seen (00 00 01 B3 ...), for after a seek */
+    uint32_t seqhdr_len;
+    int need_seqhdr;            /* flushed: the next packet gets seqhdr in front unless it has one */
+};
+
+/* The sequence header at the start of a packet: from 00 00 01 B3 up to the next
+ * GOP or picture start code. */
+static uint32_t mav_mpeg_seqhdr_len( const uint8_t *data, uint32_t size )
+{
+    uint32_t i;
+
+    if (size < 12 || data[0] || data[1] || data[2] != 1 || data[3] != 0xb3) return 0;
+    for (i = 4; i + 4 <= size; i++)
+        if (!data[i] && !data[i + 1] && data[i + 2] == 1 && (data[i + 3] == 0xb8 || data[i + 3] == 0x00))
+            return i;
+    return 0;
+}
+
+struct mav_lavc_pic
+{
+    AVFrame *frame;
+    uint8_t *uv;
+    uint32_t uv_stride;
+};
+
+static int mav_lavc_vsupports( int codec )
+{
+    return codec == MAV_BACKEND_MPEG1 || codec == MAV_BACKEND_MPEG2;
+}
+
+static void mav_lavc_vclose( void *handle )
+{
+    struct mav_lavc_vdec *d = handle;
+
+    if (!d) return;
+    avcodec_free_context( &d->ctx );
+    av_packet_free( &d->pkt );
+    free( d );
+}
+
+static void *mav_lavc_vopen( int codec, const uint8_t *extradata, uint32_t extradata_size,
+                             uint32_t width, uint32_t height, char *why, size_t why_size )
+{
+    const AVCodec *c = avcodec_find_decoder( codec == MAV_BACKEND_MPEG1 ? AV_CODEC_ID_MPEG1VIDEO : AV_CODEC_ID_MPEG2VIDEO );
+    struct mav_lavc_vdec *d;
+
+    if (!c)
+    {
+        snprintf( why, why_size, "libavcodec has no %s decoder in this build", codec == MAV_BACKEND_MPEG1 ? "mpeg1video" : "mpeg2video" );
+        return NULL;
+    }
+    if (!(d = calloc( 1, sizeof(*d) ))) return NULL;
+    if (!(d->ctx = avcodec_alloc_context3( c )) || !(d->pkt = av_packet_alloc()))
+    {
+        mav_lavc_vclose( d );
+        return NULL;
+    }
+    d->ctx->width = width;
+    d->ctx->height = height;
+    d->ctx->thread_count = 1;
+    /* The container's sequence header: decoding can start at a GOP that does not
+     * repeat it (the analysis read past the first one, and a seek lands later). */
+    if (extradata && extradata_size)
+    {
+        if (!(d->ctx->extradata = av_mallocz( extradata_size + AV_INPUT_BUFFER_PADDING_SIZE )))
+        {
+            mav_lavc_vclose( d );
+            return NULL;
+        }
+        memcpy( d->ctx->extradata, extradata, extradata_size );
+        d->ctx->extradata_size = extradata_size;
+    }
+    if (avcodec_open2( d->ctx, c, NULL ) < 0)
+    {
+        snprintf( why, why_size, "%s decoder did not open", c->name );
+        mav_lavc_vclose( d );
+        return NULL;
+    }
+    return d;
+}
+
+static int mav_lavc_vdecode( void *handle, const uint8_t *data, uint32_t size, int64_t pts, int64_t duration,
+                             int keyframe, mav_vframe_emit emit, void *ctx )
+{
+    struct mav_lavc_vdec *d = handle;
+    int err, result = 0;
+
+    (void)keyframe;
+    if (data && size)
+    {
+        uint32_t hdr = mav_mpeg_seqhdr_len( data, size ), pre = 0;
+
+        if (hdr && hdr <= sizeof(d->seqhdr))
+        {
+            memcpy( d->seqhdr, data, hdr );
+            d->seqhdr_len = hdr;
+        }
+        if (d->need_seqhdr && !hdr) pre = d->seqhdr_len;
+        d->need_seqhdr = 0;
+        if (av_new_packet( d->pkt, pre + size ) < 0) return AVERROR(ENOMEM);
+        memcpy( d->pkt->data, d->seqhdr, pre );
+        memcpy( d->pkt->data + pre, data, size );
+        d->pkt->pts = pts == INT64_MIN ? AV_NOPTS_VALUE : pts;
+        d->pkt->duration = duration == INT64_MIN ? 0 : duration;
+        err = avcodec_send_packet( d->ctx, d->pkt );
+        av_packet_unref( d->pkt );
+    }
+    else err = avcodec_send_packet( d->ctx, NULL );   /* drain */
+    if (err < 0 && err != AVERROR_EOF && err != AVERROR(EAGAIN)) result = err;
+
+    for (;;)
+    {
+        struct mav_lavc_pic *pic;
+        AVFrame *frame = av_frame_alloc();
+        int64_t fpts;
+
+        if (!frame) return AVERROR(ENOMEM);
+        if (avcodec_receive_frame( d->ctx, frame ) < 0)
+        {
+            av_frame_free( &frame );
+            break;
+        }
+        if ((frame->format != AV_PIX_FMT_YUV420P && frame->format != AV_PIX_FMT_YUVJ420P)
+            || !(pic = calloc( 1, sizeof(*pic) )))
+        {
+            av_frame_free( &frame );   /* 4:2:2 / 4:4:4 MPEG-2 is not offered as NV12 */
+            continue;
+        }
+        pic->frame = frame;
+        fpts = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
+        emit( ctx, pic, fpts == AV_NOPTS_VALUE ? INT64_MIN : fpts, frame->duration > 0 ? frame->duration : INT64_MIN );
+    }
+    return result;
+}
+
+static int mav_lavc_vmap( void *handle, struct mav_vplanes *planes )
+{
+    struct mav_lavc_pic *pic = handle;
+    AVFrame *f = pic->frame;
+    uint32_t cw = (f->width + 1) / 2, ch = (f->height + 1) / 2, x, y;
+
+    if (!pic->uv)
+    {
+        pic->uv_stride = cw * 2;
+        if (!(pic->uv = malloc( (size_t)pic->uv_stride * ch ))) return -1;
+        for (y = 0; y < ch; y++)
+        {
+            const uint8_t *u = f->data[1] + (size_t)y * f->linesize[1], *v = f->data[2] + (size_t)y * f->linesize[2];
+            uint8_t *o = pic->uv + (size_t)y * pic->uv_stride;
+            for (x = 0; x < cw; x++) { o[2 * x] = u[x]; o[2 * x + 1] = v[x]; }
+        }
+    }
+    planes->y = f->data[0];
+    planes->y_stride = f->linesize[0];
+    planes->uv = pic->uv;
+    planes->uv_stride = pic->uv_stride;
+    planes->width = f->width;
+    planes->height = f->height;
+    planes->full_range = f->format == AV_PIX_FMT_YUVJ420P || f->color_range == AVCOL_RANGE_JPEG;
+    return 0;
+}
+
+static void mav_lavc_vunmap( void *handle ) { (void)handle; }
+
+static void mav_lavc_vrelease( void *handle )
+{
+    struct mav_lavc_pic *pic = handle;
+
+    if (!pic) return;
+    av_frame_free( &pic->frame );
+    free( pic->uv );
+    free( pic );
+}
+
+static void mav_lavc_vflush( void *handle )
+{
+    struct mav_lavc_vdec *d = handle;
+    avcodec_flush_buffers( d->ctx );
+    d->need_seqhdr = 1;
+}
+
+static const struct mav_video_backend mav_lavc_video_backend =
+{
+    "libavcodec", mav_lavc_vsupports, mav_lavc_vopen, mav_lavc_vdecode, mav_lavc_vmap,
+    mav_lavc_vunmap, mav_lavc_vrelease, mav_lavc_vflush, mav_lavc_vclose,
+};
+
 /* ---- the log: bounded, and deduplicated ---- */
 static pthread_mutex_t mav_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct { uint32_t hash; uint32_t count; } mav_log_seen[MAV_MAX_LOGS];
@@ -371,6 +574,7 @@ struct mav_stream
 
     /* ---- video ---- */
     void *vdec;
+    const struct mav_video_backend *vb;   /* the backend vdec belongs to */
     struct mav_video_output vout;
     struct mav_vframe *reorder; /* sorted by pts */
     unsigned int reorder_count, reorder_cap;
@@ -424,6 +628,8 @@ struct mav_parser
     AVFormatContext *fmt;
     AVPacket *read_pkt;
     int is_mov;
+    int is_mpeg;                /* MPEG-1/2 program stream */
+    uint64_t base;              /* bytes of a wrapper header the demuxer never sees (VSD1) */
     int ready;                  /* connected and streams exposed */
     int demux_eof;
     unsigned int read_errors_logged;
@@ -442,7 +648,7 @@ static int mav_avio_read( void *opaque, uint8_t *dest, int size )
     int result;
 
     if (size <= 0) return AVERROR(EINVAL);
-    if (p->file_size && p->pos >= p->file_size) return AVERROR_EOF;
+    if (p->file_size && p->base + p->pos >= p->file_size) return AVERROR_EOF;
     if (size > MAV_MAX_REQUEST) size = MAV_MAX_REQUEST;
 
     pthread_mutex_lock( &p->io_lock );
@@ -452,7 +658,7 @@ static int mav_avio_read( void *opaque, uint8_t *dest, int size )
         return AVERROR_EXIT;
     }
     p->req.dest = dest;
-    p->req.offset = p->pos;
+    p->req.offset = p->base + p->pos;
     p->req.size = size;
     p->req.done = 0;
     p->req.result = 0;
@@ -488,7 +694,7 @@ static int64_t mav_avio_seek( void *opaque, int64_t offset, int whence )
     switch (whence)
     {
     case AVSEEK_SIZE:
-        return p->file_size ? (int64_t)p->file_size : AVERROR(ENOSYS);
+        return p->file_size ? (int64_t)(p->file_size - p->base) : AVERROR(ENOSYS);
     case SEEK_SET:
         target = offset;
         break;
@@ -497,7 +703,7 @@ static int64_t mav_avio_seek( void *opaque, int64_t offset, int whence )
         break;
     case SEEK_END:
         if (!p->file_size) return AVERROR(ENOSYS);
-        target = (int64_t)p->file_size + offset;
+        target = (int64_t)(p->file_size - p->base) + offset;
         break;
     default:
         return AVERROR(EINVAL);
@@ -594,7 +800,7 @@ static void mav_reorder_clear( struct mav_stream *s )
     unsigned int i;
 
     for (i = 0; i < s->reorder_count; i++)
-        if (mav_vbackend) mav_vbackend->release( s->reorder[i].handle );
+        if (s->vb) s->vb->release( s->reorder[i].handle );
     s->reorder_count = 0;
 }
 
@@ -603,7 +809,7 @@ static void mav_stream_free( struct mav_stream *s )
     if (!s) return;
     mav_reorder_clear( s );
     free( s->reorder );
-    if (s->vdec && mav_vbackend) mav_vbackend->close( s->vdec );
+    if (s->vdec && s->vb) s->vb->close( s->vdec );
     if (s->adec && mav_abackend) mav_abackend->close( s->adec );
     mav_queue_clear( s );
     free( s->queue );
@@ -634,7 +840,8 @@ static void mav_teardown( struct mav_parser *p )
         av_freep( &p->avio->buffer );
         avio_context_free( &p->avio );
     }
-    p->ready = p->is_mov = p->demux_eof = 0;
+    p->ready = p->is_mov = p->is_mpeg = p->demux_eof = 0;
+    p->base = 0;
     p->read_errors_logged = 0;
     p->stop = -1;
 }
@@ -961,12 +1168,16 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
     {
     case AV_CODEC_ID_H264: codec = MAV_BACKEND_H264; s->info.kind = MAV_CODEC_H264; break;
     case AV_CODEC_ID_HEVC: codec = MAV_BACKEND_HEVC; s->info.kind = MAV_CODEC_HEVC; break;
+    case AV_CODEC_ID_MPEG1VIDEO: codec = MAV_BACKEND_MPEG1; s->info.kind = MAV_CODEC_MPEG1; break;
+    case AV_CODEC_ID_MPEG2VIDEO: codec = MAV_BACKEND_MPEG2; s->info.kind = MAV_CODEC_MPEG2; break;
     default:
         snprintf( why, why_size, "no decoder for it in this port" );
         return MAV_E_UNSUPPORTED;
     }
     snprintf( s->info.codec, sizeof(s->info.codec), "%s", avcodec_get_name( par->codec_id ) );
-    if (!mav_vbackend || !mav_vbackend->supports( codec ))
+    /* MPEG-1/2 video: libavcodec's own decoder; H.264/HEVC: the platform's */
+    s->vb = mav_lavc_video_backend.supports( codec ) ? &mav_lavc_video_backend : mav_vbackend;
+    if (!s->vb || !s->vb->supports( codec ))
     {
         snprintf( why, why_size, "no video decoder backend for it" );
         return MAV_E_UNSUPPORTED;
@@ -976,10 +1187,10 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
         snprintf( why, why_size, "unusable picture size %dx%d", par->width, par->height );
         return MAV_E_UNSUPPORTED;
     }
-    if (!(s->vdec = mav_vbackend->open( codec, par->extradata, par->extradata_size, par->width, par->height,
-                                        why, why_size )))
+    if (!(s->vdec = s->vb->open( codec, par->extradata, par->extradata_size, par->width, par->height,
+                                 why, why_size )))
         return MAV_E_UNSUPPORTED;
-    snprintf( s->info.backend, sizeof(s->info.backend), "%s", mav_vbackend->name );
+    snprintf( s->info.backend, sizeof(s->info.backend), "%s", s->vb->name );
 
     if (fps.num <= 0 || fps.den <= 0) fps = st->r_frame_rate;
     if (fps.num <= 0 || fps.den <= 0 || av_q2d( fps ) > 1000)
@@ -1028,6 +1239,22 @@ static int mav_connect_locked( struct mav_parser *p )
         av_free( avio_buf );
         return MAV_E_NOMEM;
     }
+    /* A VSD1 file (AI6WIN visual novels' movies) is an 8-byte header -- "VSD1",
+     * then a little-endian offset -- and something the game reads itself, then
+     * an ordinary MPEG program stream at 8 + offset: the demuxer starts there. */
+    {
+        uint8_t hdr[8];
+        if (mav_avio_read( p, hdr, sizeof(hdr) ) == sizeof(hdr) && !memcmp( hdr, "VSD1", 4 ))
+        {
+            uint64_t skip = 8 + (uint64_t)AV_RL32( hdr + 4 );
+            if (!p->file_size || skip < p->file_size)
+            {
+                p->base = skip;
+                mav_log( "VSD1 wrapper: the MPEG stream starts at byte %llu", (unsigned long long)skip );
+            }
+        }
+        p->pos = 0;
+    }
     if (!(p->fmt = avformat_alloc_context())) return MAV_E_NOMEM;
     p->fmt->pb = p->avio;
     p->fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
@@ -1043,9 +1270,10 @@ static int mav_connect_locked( struct mav_parser *p )
     name = p->fmt->iformat->name;
     is_mp3 = !strcmp( name, "mp3" );
     p->is_mov = !strcmp( name, MAV_MOV_NAME );
-    if (!is_mp3 && strcmp( name, "wav" ) && !(p->is_mov && mav_video_allowed))
-        return mav_refuse( p, MAV_E_UNSUPPORTED, p->is_mov ? "container disabled by MADEIRA_WG_VIDEO=0"
-                                                            : "container not in the allowlist" );
+    p->is_mpeg = !strcmp( name, "mpeg" );
+    if (!is_mp3 && strcmp( name, "wav" ) && !((p->is_mov || p->is_mpeg) && mav_video_allowed))
+        return mav_refuse( p, MAV_E_UNSUPPORTED, p->is_mov || p->is_mpeg ? "container disabled by MADEIRA_WG_VIDEO=0"
+                                                                          : "container not in the allowlist" );
     if (p->fmt->probe_score < (p->is_mov ? MAV_MIN_MOV_PROBE_SCORE : MAV_MIN_PROBE_SCORE))
     {
         snprintf( why, sizeof(why), "probe score %d below %d", p->fmt->probe_score,
@@ -1055,7 +1283,7 @@ static int mav_connect_locked( struct mav_parser *p )
     /* The mp3 demuxer only ever carries MPEG audio and an MP4 only compressed
      * streams: a compressed-output parser is refused before the stream
      * analysis reads anything more. */
-    if (p->output_compressed && (is_mp3 || p->is_mov))
+    if (p->output_compressed && (is_mp3 || p->is_mov || p->is_mpeg))
         return mav_refuse( p, MAV_E_UNSUPPORTED,
                            "compressed output requested and no decoder filter exists; "
                            "the decoding splitter is tried next" );
@@ -1065,7 +1293,7 @@ static int mav_connect_locked( struct mav_parser *p )
     for (i = 0; i < p->fmt->nb_streams; i++)
     {
         enum AVMediaType type = p->fmt->streams[i]->codecpar->codec_type;
-        if (type != AVMEDIA_TYPE_AUDIO && !(p->is_mov && type == AVMEDIA_TYPE_VIDEO))
+        if (type != AVMEDIA_TYPE_AUDIO && !((p->is_mov || p->is_mpeg) && type == AVMEDIA_TYPE_VIDEO))
             p->fmt->streams[i]->discard = AVDISCARD_ALL;
     }
 
@@ -1080,12 +1308,12 @@ static int mav_connect_locked( struct mav_parser *p )
         if (s->disposition & AV_DISPOSITION_ATTACHED_PIC) continue;
         if (s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
         {
-            if (!p->is_mov) return mav_refuse( p, MAV_E_UNSUPPORTED, "the file has a video stream" );
+            if (!p->is_mov && !p->is_mpeg) return mav_refuse( p, MAV_E_UNSUPPORTED, "the file has a video stream" );
             if (!vst) vst = s;
         }
         if (s->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && !ast) ast = s;
     }
-    if (!vst && !ast) return mav_refuse( p, MAV_E_UNSUPPORTED, p->is_mov ? "no audio or video stream" : "no audio stream" );
+    if (!vst && !ast) return mav_refuse( p, MAV_E_UNSUPPORTED, p->is_mov || p->is_mpeg ? "no audio or video stream" : "no audio stream" );
 
     if (!(p->read_pkt = av_packet_alloc())) return MAV_E_NOMEM;
 
@@ -1721,7 +1949,7 @@ static void mav_vframe_emit_cb( void *ctx, void *handle, int64_t pts, int64_t du
         struct mav_vframe *grown = realloc( s->reorder, cap * sizeof(*grown) );
         if (!grown)
         {
-            mav_vbackend->release( handle );
+            s->vb->release( handle );
             return;
         }
         s->reorder = grown;
@@ -1881,28 +2109,28 @@ static int mav_video_emit( struct mav_parser *p, struct mav_stream *s, struct ma
     {
         if (pts + dur <= s->seek_target)
         {
-            mav_vbackend->release( f->handle );
+            s->vb->release( f->handle );
             return 0;
         }
         s->seek_target = -1;
     }
     if (p->stop >= 0 && pts >= p->stop)
     {
-        mav_vbackend->release( f->handle );
+        s->vb->release( f->handle );
         s->eos = 1;
         return 0;
     }
     size = mav_video_layout( s->vout.fmt, s->vout.width, s->vout.height < 0 ? -s->vout.height : s->vout.height, &l );
     if (!size || size > UINT32_MAX || !mav_reserve( s, size ))
     {
-        mav_vbackend->release( f->handle );
+        s->vb->release( f->handle );
         s->eos = 1;
         mav_log( "stream %u: cannot hold a %zu-byte picture; ending the stream", s->number, size );
         return 0;
     }
-    if (mav_vbackend->map( f->handle, &planes ))
+    if (s->vb->map( f->handle, &planes ))
     {
-        mav_vbackend->release( f->handle );
+        s->vb->release( f->handle );
         if (s->errors_logged < 3)
         {
             s->errors_logged++;
@@ -1912,8 +2140,8 @@ static int mav_video_emit( struct mav_parser *p, struct mav_stream *s, struct ma
         return 0;
     }
     mav_convert_picture( s, &planes, s->buf, &l );
-    mav_vbackend->unmap( f->handle );
-    mav_vbackend->release( f->handle );
+    s->vb->unmap( f->handle );
+    s->vb->release( f->handle );
 
     s->next_pts = pts + dur;
     s->cur.pts = pts > 0 ? (uint64_t)pts : 0;
@@ -1953,10 +2181,13 @@ static int mav_video_next( struct mav_parser *p, struct mav_stream *s )
         }
         if (!mav_next_packet( p, s, s->pkt ))
         {
+            /* libavcodec holds the last picture back until it is drained */
+            if (s->vb == &mav_lavc_video_backend)
+                s->vb->decode( s->vdec, NULL, 0, INT64_MIN, INT64_MIN, 0, mav_vframe_emit_cb, s );
             s->draining = 1;
             continue;
         }
-        err = mav_vbackend->decode( s->vdec, s->pkt->data, s->pkt->size,
+        err = s->vb->decode( s->vdec, s->pkt->data, s->pkt->size,
                                     s->pkt->pts != AV_NOPTS_VALUE ? s->pkt->pts : INT64_MIN,
                                     s->pkt->duration > 0 ? s->pkt->duration : INT64_MIN,
                                     !!(s->pkt->flags & AV_PKT_FLAG_KEY), mav_vframe_emit_cb, s );
@@ -2079,8 +2310,19 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
          * the PE side's way to start over, so it must not stay failed. */
         p->avio->error = 0;
         p->avio->eof_reached = 0;
-        err = avformat_seek_file( p->fmt, ref->av_index, INT64_MIN, ts, ts, 0 );
-        if (err < 0) err = av_seek_frame( p->fmt, ref->av_index, ts, AVSEEK_FLAG_BACKWARD );
+        if (p->is_mpeg && target <= 0)
+        {
+            /* An MPEG program stream has no index: avformat_seek_file searches by
+             * timestamp and lands after the first GOP, whose sequence header the
+             * decoder needs.  The start is byte 0 (of the stream, after any wrapper). */
+            err = avio_seek( p->fmt->pb, 0, SEEK_SET ) < 0 ? AVERROR(EIO) : 0;
+            if (!err) avformat_flush( p->fmt );
+        }
+        else
+        {
+            err = avformat_seek_file( p->fmt, ref->av_index, INT64_MIN, ts, ts, 0 );
+            if (err < 0) err = av_seek_frame( p->fmt, ref->av_index, ts, AVSEEK_FLAG_BACKWARD );
+        }
         if (err < 0)
         {
             mav_log( "seek to %llums failed (%d)", (unsigned long long)(start / 10000), err );
@@ -2098,7 +2340,7 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
                 if (c->vdec)
                 {
                     mav_reorder_clear( c );
-                    mav_vbackend->flush( c->vdec );
+                    c->vb->flush( c->vdec );
                 }
                 swr_free( &c->swr );
                 if (c->pkt_pending) av_packet_unref( c->pkt );

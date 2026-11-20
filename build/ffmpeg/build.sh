@@ -111,9 +111,10 @@ CONFIG_ARGS=(
     --disable-everything
     --enable-decoder=wmav1,wmav2,wmapro,wmalossless,xma1,xma2
     --enable-decoder=mp1,mp2,mp3
+    --enable-decoder=mpeg1video,mpeg2video
     --enable-decoder=pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le
-    --enable-demuxer=mp3,wav,mov
-    --enable-parser=mpegaudio
+    --enable-demuxer=mp3,wav,mov,mpegps,mpegvideo
+    --enable-parser=mpegaudio,mpegvideo
     --disable-programs
     --disable-doc
     --disable-network
