@@ -1,8 +1,16 @@
 diff --git a/dlls/quartz/filtergraph.c b/dlls/quartz/filtergraph.c
-index 17e5bb1..9d20146 100644
+index 17e5bb1..f4662b1 100644
 --- a/dlls/quartz/filtergraph.c
 +++ b/dlls/quartz/filtergraph.c
-@@ -151,6 +151,10 @@ struct filter_graph
+@@ -20,6 +20,7 @@
+ 
+ #include <assert.h>
+ #include <stdarg.h>
++#include <stdlib.h>
+ 
+ #define COBJMACROS
+ 
+@@ -151,6 +152,10 @@ struct filter_graph
  
      unsigned int needs_async_run : 1;
      unsigned int threaded : 1;
@@ -13,7 +21,54 @@ index 17e5bb1..9d20146 100644
  };
  
  struct enum_filters
-@@ -1888,6 +1892,7 @@ static HRESULT WINAPI MediaControl_Run(IMediaControl *iface)
+@@ -1769,6 +1774,28 @@ static void update_render_count(struct filter_graph *graph)
+ }
+ 
+ /* Perform the paused -> running transition. The caller must hold graph->cs. */
++static LONGLONG graph_start_delay(void)
++{
++    static LONG delay = -1;
++    LONG value = ReadNoFence(&delay);
++
++    if (value < 0)
++    {
++        char buffer[16];
++        DWORD len = GetEnvironmentVariableA("MADEIRA_DSHOW_START_DELAY_MS", buffer, sizeof(buffer));
++
++        value = 30;
++        if (len && len < sizeof(buffer))
++        {
++            value = atoi(buffer);
++            if (value < 0) value = 0;
++            if (value > 1000) value = 1000;
++        }
++        InterlockedExchange(&delay, value);
++    }
++    return value;
++}
++
+ static HRESULT graph_start(struct filter_graph *graph, REFERENCE_TIME stream_start)
+ {
+     struct media_event *event, *next;
+@@ -1799,9 +1826,14 @@ static HRESULT graph_start(struct filter_graph *graph, REFERENCE_TIME stream_sta
+     {
+         IReferenceClock_GetTime(graph->refClock, &graph->stream_start);
+         stream_start = graph->stream_start - graph->stream_elapsed;
+-        /* Delay presentation time by 200 ms, to give filters time to
+-         * initialize. */
+-        stream_start += 200 * 10000;
++        /* Delay presentation time, to give filters time to initialize.
++         * Madeira: 30 ms instead of 200 (MADEIRA_DSHOW_START_DELAY_MS).  Every
++         * Run -- and every SetPositions while running, which pauses and runs
++         * again -- held the picture this long: an AI6WIN visual novel loops its
++         * movies with SetPositions and froze for 0.2 s at each loop point.  By
++         * the time graph_start() runs, every filter has paused (cued its first
++         * sample), so a short delay is enough. */
++        stream_start += graph_start_delay() * 10000;
+     }
+ 
+     if (SUCCEEDED(IMediaSeeking_GetStopPosition(&graph->IMediaSeeking_iface, &stream_stop)))
+@@ -1888,6 +1920,7 @@ static HRESULT WINAPI MediaControl_Run(IMediaControl *iface)
      TRACE("graph %p.\n", graph);
  
      EnterCriticalSection(&graph->cs);
@@ -21,7 +76,7 @@ index 17e5bb1..9d20146 100644
  
      if (graph->state == State_Running)
      {
-@@ -2015,22 +2020,44 @@ static HRESULT WINAPI MediaControl_get_RegFilterCollection(IMediaControl *iface,
+@@ -2015,22 +2048,44 @@ static HRESULT WINAPI MediaControl_get_RegFilterCollection(IMediaControl *iface,
      return S_OK;
  }
  
@@ -71,7 +126,7 @@ index 17e5bb1..9d20146 100644
  }
  
  static void CALLBACK wait_stop_cb(TP_CALLBACK_INSTANCE *instance, void *context)
-@@ -2058,8 +2085,18 @@ static HRESULT WINAPI MediaControl_StopWhenReady(IMediaControl *iface)
+@@ -2058,8 +2113,18 @@ static HRESULT WINAPI MediaControl_StopWhenReady(IMediaControl *iface)
          return hr;
      else if (hr == S_FALSE)
      {
@@ -91,7 +146,7 @@ index 17e5bb1..9d20146 100644
          return S_FALSE;
      }
  
-@@ -5069,6 +5106,7 @@ static HRESULT WINAPI MediaFilter_Stop(IMediaFilter *iface)
+@@ -5069,6 +5134,7 @@ static HRESULT WINAPI MediaFilter_Stop(IMediaFilter *iface)
      TRACE("graph %p.\n", graph);
  
      EnterCriticalSection(&graph->cs);
@@ -99,7 +154,7 @@ index 17e5bb1..9d20146 100644
  
      if (graph->state == State_Stopped)
      {
-@@ -5121,6 +5159,7 @@ static HRESULT WINAPI MediaFilter_Pause(IMediaFilter *iface)
+@@ -5121,6 +5187,7 @@ static HRESULT WINAPI MediaFilter_Pause(IMediaFilter *iface)
      TRACE("graph %p.\n", graph);
  
      EnterCriticalSection(&graph->cs);
@@ -107,7 +162,7 @@ index 17e5bb1..9d20146 100644
  
      if (graph->state == State_Paused)
      {
-@@ -5172,6 +5211,7 @@ static HRESULT WINAPI MediaFilter_Run(IMediaFilter *iface, REFERENCE_TIME start)
+@@ -5172,6 +5239,7 @@ static HRESULT WINAPI MediaFilter_Run(IMediaFilter *iface, REFERENCE_TIME start)
      TRACE("graph %p, start %s.\n", graph, debugstr_time(start));
  
      EnterCriticalSection(&graph->cs);
