@@ -305,6 +305,7 @@ struct mav_lavc_vdec
     uint8_t seqhdr[512];        /* the last sequence header seen (00 00 01 B3 ...), for after a seek */
     uint32_t seqhdr_len;
     int need_seqhdr;            /* flushed: the next packet gets seqhdr in front unless it has one */
+    int have_key;               /* a keyframe was output since open / the last flush */
 };
 
 /* The sequence header at the start of a packet: from 00 00 01 B3 up to the next
@@ -373,7 +374,21 @@ static void *mav_lavc_vopen( int codec, const uint8_t *extradata, uint32_t extra
         }
         memcpy( d->ctx->extradata, extradata, extradata_size );
         d->ctx->extradata_size = extradata_size;
+        {
+            /* the sequence header is also what a flush puts back in front */
+            uint32_t n = mav_mpeg_seqhdr_len( extradata, extradata_size );
+            if (!n) n = extradata_size;
+            if (n <= sizeof(d->seqhdr))
+            {
+                memcpy( d->seqhdr, extradata, n );
+                d->seqhdr_len = n;
+            }
+        }
     }
+    /* A picture whose references are missing (the stream entered mid-GOP) is
+     * not output: libavcodec would conceal it as a grey, blocky frame. */
+    d->ctx->flags &= ~AV_CODEC_FLAG_OUTPUT_CORRUPT;
+    d->need_seqhdr = 1;
     if (avcodec_open2( d->ctx, c, NULL ) < 0)
     {
         snprintf( why, why_size, "%s decoder did not open", c->name );
@@ -430,6 +445,14 @@ static int mav_lavc_vdecode( void *handle, const uint8_t *data, uint32_t size, i
             av_frame_free( &frame );   /* 4:2:2 / 4:4:4 MPEG-2 is not offered as NV12 */
             continue;
         }
+        /* nothing before the first keyframe, and no concealed (corrupt) picture */
+        if (frame->flags & AV_FRAME_FLAG_KEY) d->have_key = 1;
+        if (!d->have_key || (frame->flags & AV_FRAME_FLAG_CORRUPT) || frame->decode_error_flags)
+        {
+            av_frame_free( &frame );
+            free( pic );
+            continue;
+        }
         pic->frame = frame;
         fpts = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
         emit( ctx, pic, fpts == AV_NOPTS_VALUE ? INT64_MIN : fpts, frame->duration > 0 ? frame->duration : INT64_MIN );
@@ -481,6 +504,7 @@ static void mav_lavc_vflush( void *handle )
     struct mav_lavc_vdec *d = handle;
     avcodec_flush_buffers( d->ctx );
     d->need_seqhdr = 1;
+    d->have_key = 0;
 }
 
 static const struct mav_video_backend mav_lavc_video_backend =
@@ -1157,13 +1181,42 @@ static int mav_open_audio( struct mav_parser *p, struct mav_stream *s, AVStream 
     return MAV_OK;
 }
 
+/* The first MPEG video sequence header in the first 256 KB of the stream, read
+ * through the demuxer's own AVIO (and its position put back); 0 if none. */
+static uint32_t mav_mpeg_find_seqhdr( struct mav_parser *p, uint8_t *out, uint32_t out_size )
+{
+    const uint32_t window = 256 * 1024;
+    int64_t pos = avio_tell( p->fmt->pb );
+    uint32_t i, len = 0;
+    uint8_t *buf;
+    int got;
+
+    if (pos < 0 || !(buf = av_malloc( window ))) return 0;
+    if (avio_seek( p->fmt->pb, 0, SEEK_SET ) >= 0 && (got = avio_read( p->fmt->pb, buf, window )) > 0)
+    {
+        for (i = 0; i + 12 <= (uint32_t)got; i++)
+        {
+            uint32_t n;
+            if (buf[i] || buf[i + 1] || buf[i + 2] != 1 || buf[i + 3] != 0xb3) continue;
+            if ((n = mav_mpeg_seqhdr_len( buf + i, got - i )) && n <= out_size)
+            {
+                memcpy( out, buf + i, n );
+                len = n;
+            }
+            break;
+        }
+    }
+    avio_seek( p->fmt->pb, pos, SEEK_SET );
+    av_free( buf );
+    return len;
+}
+
 static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream *st, char *why, size_t why_size )
 {
     const AVCodecParameters *par = st->codecpar;
     AVRational fps = st->avg_frame_rate;
     int codec;
 
-    (void)p;
     switch (par->codec_id)
     {
     case AV_CODEC_ID_H264: codec = MAV_BACKEND_H264; s->info.kind = MAV_CODEC_H264; break;
@@ -1187,9 +1240,18 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
         snprintf( why, why_size, "unusable picture size %dx%d", par->width, par->height );
         return MAV_E_UNSUPPORTED;
     }
-    if (!(s->vdec = s->vb->open( codec, par->extradata, par->extradata_size, par->width, par->height,
-                                 why, why_size )))
-        return MAV_E_UNSUPPORTED;
+    if (par->extradata_size || (codec != MAV_BACKEND_MPEG1 && codec != MAV_BACKEND_MPEG2))
+        s->vdec = s->vb->open( codec, par->extradata, par->extradata_size, par->width, par->height, why, why_size );
+    else
+    {
+        /* MPEG-1/2 in a program stream has no codec data; the decoder gets the
+         * stream's first sequence header, so a stream entered without one (a
+         * seek, or packets the analysis consumed) still decodes. */
+        uint8_t hdr[512];
+        uint32_t len = mav_mpeg_find_seqhdr( p, hdr, sizeof(hdr) );
+        s->vdec = s->vb->open( codec, len ? hdr : NULL, len, par->width, par->height, why, why_size );
+    }
+    if (!s->vdec) return MAV_E_UNSUPPORTED;
     snprintf( s->info.backend, sizeof(s->info.backend), "%s", s->vb->name );
 
     if (fps.num <= 0 || fps.den <= 0) fps = st->r_frame_rate;
@@ -2310,7 +2372,7 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
          * the PE side's way to start over, so it must not stay failed. */
         p->avio->error = 0;
         p->avio->eof_reached = 0;
-        if (p->is_mpeg && target <= 0)
+        if (p->is_mpeg && target <= 10000000)
         {
             /* An MPEG program stream has no index: avformat_seek_file searches by
              * timestamp and lands after the first GOP, whose sequence header the
@@ -2320,6 +2382,10 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
         }
         else
         {
+            /* An MPEG stream has no keyframe index: start a second (more than a
+             * GOP) early; the decoder waits for a keyframe and seek_target drops
+             * the pictures before the target, so the first one shown is exact. */
+            if (p->is_mpeg) ts -= av_rescale_q( 10000000, (AVRational){ 1, 10000000 }, ref->time_base );
             err = avformat_seek_file( p->fmt, ref->av_index, INT64_MIN, ts, ts, 0 );
             if (err < 0) err = av_seek_frame( p->fmt, ref->av_index, ts, AVSEEK_FLAG_BACKWARD );
         }
