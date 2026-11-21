@@ -5407,70 +5407,38 @@ static void *ios_mach_exception_thread( void *arg )
                         uint32_t value = (uint32_t)IOS_STORE_SRC(rt);
                         emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                     }
-                    /* STR (immediate, post/pre-index, 64-bit): 1111 1000 00 0imm9 0[10]1 Rn Rt */
-                    else if ((insn & 0xffe00000) == 0xf8000000 && (insn & 0x800) == 0)
+                    /* STR/STRB/STRH/STUR with a 9-bit immediate, every width:
+                     *   ss11 1000 000i iiii iiii xxnn nnnt tttt   (mask 0x3fe00000, val 0x38000000)
+                     * bits 11:10 = 00 unscaled (STUR*), 01 post-index, 11 pre-index;
+                     * 10 is STTR*, not handled here. The four per-width branches this
+                     * replaces required bit 11 clear, so every PRE-INDEX form fell through
+                     * to [store-undecoded]: KINGDOM HEARTS HD 2.8's heap initializer runs
+                     * `strh w10, [x12, #56]!` (0x78038d8a) on an executable heap, the store
+                     * went back to the guest and FEX retried it forever (2.9 million
+                     * "Handled self-modifying code" lines, no window). fault_addr is the
+                     * effective address for all three forms; post- and pre-index then add
+                     * imm9 to Rn, with Rn 29/30/31 meaning FP/LR/SP. */
+                    else if ((insn & 0x3fe00000) == 0x38000000 && ((insn >> 10) & 3) != 2)
                     {
                         int rt = insn & 0x1f;
+                        unsigned width = 1u << (insn >> 30);
                         uint64_t value = IOS_STORE_SRC(rt);
-                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
-                        /* Post-index (bits 11:10 = 01) / pre-index (bits 11:10 = 11):
-                         * MUST update Rn += signed imm9. Without this, memcpy-style
-                         * loops would write the same address forever. */
-                        int idx_mode = (insn >> 10) & 3;  // bits 11:10
-                        if (emulated && (idx_mode == 1 || idx_mode == 3))
+                        emulated = ios_alias_write( fault_addr, &value, width, &alias_fault, honor_guest_prot );
+                        if (emulated && ((insn >> 10) & 3) != 0)
                         {
                             int rn = (insn >> 5) & 0x1f;
-                            int imm9 = (insn >> 12) & 0x1ff;
-                            if (imm9 & 0x100) imm9 |= ~0x1ff;  // sign-extend 9-bit
-                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                            int64_t imm9 = (int64_t)((insn >> 12) & 0x1ff);
+                            if (imm9 & 0x100) imm9 -= 0x200;
+                            if (rn == 31)      state.__sp = (uint64_t)((int64_t)state.__sp + imm9);
+                            else if (rn == 30) state.__lr = (uint64_t)((int64_t)state.__lr + imm9);
+                            else if (rn == 29) state.__fp = (uint64_t)((int64_t)state.__fp + imm9);
+                            else               state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
                         }
-                    }
-                    /* STR (immediate, post/pre-index, 32-bit): 1011 1000 00 0imm9 0[10]1 Rn Rt */
-                    else if ((insn & 0xffe00000) == 0xb8000000 && (insn & 0x800) == 0)
-                    {
-                        int rt = insn & 0x1f;
-                        uint32_t value = (uint32_t)IOS_STORE_SRC(rt);
-                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
-                        int idx_mode = (insn >> 10) & 3;
-                        if (emulated && (idx_mode == 1 || idx_mode == 3))
                         {
-                            int rn = (insn >> 5) & 0x1f;
-                            int imm9 = (insn >> 12) & 0x1ff;
-                            if (imm9 & 0x100) imm9 |= ~0x1ff;
-                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
-                        }
-                    }
-                    /* STRB (immediate, post/pre-index, 8-bit): 0011 1000 00 0imm9 0[10]1 Rn Rt
-                     * Hits when iOS memcpy handles the trailing bytes after the
-                     * 8-byte D-store loop completes (660 bytes = 82*8 + 4 bytes
-                     * tail; the tail is byte-by-byte). */
-                    else if ((insn & 0xffe00000) == 0x38000000 && (insn & 0x800) == 0)
-                    {
-                        int rt = insn & 0x1f;
-                        uint8_t value = (uint8_t)IOS_STORE_SRC(rt);
-                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
-                        int idx_mode = (insn >> 10) & 3;
-                        if (emulated && (idx_mode == 1 || idx_mode == 3))
-                        {
-                            int rn = (insn >> 5) & 0x1f;
-                            int imm9 = (insn >> 12) & 0x1ff;
-                            if (imm9 & 0x100) imm9 |= ~0x1ff;
-                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
-                        }
-                    }
-                    /* STRH (immediate, post/pre-index, 16-bit): 0111 1000 00 0imm9 0[10]1 Rn Rt */
-                    else if ((insn & 0xffe00000) == 0x78000000 && (insn & 0x800) == 0)
-                    {
-                        int rt = insn & 0x1f;
-                        uint16_t value = (uint16_t)IOS_STORE_SRC(rt);
-                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
-                        int idx_mode = (insn >> 10) & 3;
-                        if (emulated && (idx_mode == 1 || idx_mode == 3))
-                        {
-                            int rn = (insn >> 5) & 0x1f;
-                            int imm9 = (insn >> 12) & 0x1ff;
-                            if (imm9 & 0x100) imm9 |= ~0x1ff;
-                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                            static int imm9_n;
+                            if (((insn >> 10) & 3) == 3 && imm9_n++ < 4)
+                                dprintf( STDERR_FILENO, "[store-preidx] insn=0x%08x addr=0x%llx width=%u emulated=%d\n",
+                                         insn, (unsigned long long)fault_addr, width, emulated );
                         }
                     }
                     /* SIMD/FP STR (immediate, post/pre-index, D-reg = 64-bit):
