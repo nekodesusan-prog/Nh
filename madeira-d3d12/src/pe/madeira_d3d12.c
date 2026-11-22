@@ -20940,6 +20940,16 @@ static void STDMETHODCALLTYPE device_RemoveDevice(ID3D12Device10 *This) {
  * Tsushima logged "Device removed detected (0x80004001)" and quit). S_OK
  * unless the device really is lost, the flag the rest of the runtime reports
  * DXGI_ERROR_DEVICE_REMOVED from. */
+/* Sharing a resource from another device (KINGDOM HEARTS Dream Drop
+ * Distance opens its Direct3D 11 movie frames here) is not implemented. The
+ * generated stub returned E_NOTIMPL without clearing *object, and the game
+ * then used whatever the caller's variable held: a crash at d3d12+0x5e554. */
+static HRESULT STDMETHODCALLTYPE device_OpenSharedHandle(ID3D12Device10 *This, HANDLE handle, REFIID riid, void **object) {
+    (void)This; (void)handle; (void)riid;
+    madeira_d3d12_note_unimplemented("ID3D12Device10", "OpenSharedHandle");
+    if (object) *object = NULL;
+    return E_NOTIMPL;
+}
 static HRESULT STDMETHODCALLTYPE device_GetDeviceRemovedReason(ID3D12Device10 *This) {
     return ((struct mad_device *)This)->device_lost ? DXGI_ERROR_DEVICE_REMOVED : S_OK;
 }
@@ -21233,6 +21243,7 @@ static void build_vtables(void) {
     g_device_vtbl.EnqueueMakeResident                = device_EnqueueMakeResident;
     g_device_vtbl.RemoveDevice                       = device_RemoveDevice;
     g_device_vtbl.GetDeviceRemovedReason             = device_GetDeviceRemovedReason;
+    g_device_vtbl.OpenSharedHandle                   = device_OpenSharedHandle;
     g_device_vtbl.GetAdapterLuid                     = device_GetAdapterLuid;
     g_device_vtbl.SetBackgroundProcessingMode        = device_SetBackgroundProcessingMode;
     g_device_vtbl.SetEventOnMultipleFenceCompletion  = device_SetEventOnMultipleFenceCompletion;
