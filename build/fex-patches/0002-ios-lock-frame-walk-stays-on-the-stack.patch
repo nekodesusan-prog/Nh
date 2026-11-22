@@ -1,0 +1,43 @@
+diff --git a/FEXCore/include/FEXCore/Utils/WritePriorityMutex.h b/FEXCore/include/FEXCore/Utils/WritePriorityMutex.h
+index c4a6dd4..9c85cbc 100644
+--- a/FEXCore/include/FEXCore/Utils/WritePriorityMutex.h
++++ b/FEXCore/include/FEXCore/Utils/WritePriorityMutex.h
+@@ -593,16 +593,38 @@ private:
+   static void IosFrameReturnAddresses(uint64_t (&Ra)[4]) {
+ #ifdef ARCHITECTURE_arm64
+     uint64_t Fp = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
++    /* MADEIRA: the 64 KB step limit alone let a guest RBP that happened to sit
++     * just above the thread's stack pass for a frame: KINGDOM HEARTS HD 2.8's
++     * launcher crashed here reading StackBase+0x40 (ldp in Mutex::lock). While
++     * the walk is on the thread's own stack (NT_TIB StackBase at TEB+8), every
++     * record it reads must lie below StackBase. */
++    uint64_t StackTop = 0;
++    {
++      uint64_t Teb = 0;
++      __asm volatile("mov %0, x18" : "=r"(Teb));
++      if (Teb) {
++        StackTop = *reinterpret_cast<const uint64_t*>(Teb + 8);
++      }
++    }
++    const auto OnStack = [StackTop](uint64_t P) {
++      return StackTop && P < StackTop && StackTop - P <= 0x10000000;
++    };
+     for (auto& R : Ra) {
+       if (!Fp || (Fp & 0xf)) {
+         break;
+       }
++      if (OnStack(Fp) && StackTop - Fp < 16) {
++        break;
++      }
+       const auto* Record = reinterpret_cast<const uint64_t*>(Fp);
+       R = Record[1];
+       const uint64_t Next = Record[0];
+       if (Next <= Fp || Next - Fp > 0x10000) {
+         break;
+       }
++      if (OnStack(Fp) && (Next >= StackTop || StackTop - Next < 16)) {
++        break;
++      }
+       Fp = Next;
+     }
+ #endif
