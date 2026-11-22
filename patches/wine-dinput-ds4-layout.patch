@@ -1,8 +1,8 @@
 diff --git a/dlls/dinput/joystick_ios.c b/dlls/dinput/joystick_ios.c
-index ee8342f..d1f45f3 100644
+index ee8342f..2c5ea6c 100644
 --- a/dlls/dinput/joystick_ios.c
 +++ b/dlls/dinput/joystick_ios.c
-@@ -199,6 +199,51 @@ enum ios_object_index
+@@ -199,6 +199,53 @@ enum ios_object_index
  #define IOS_VALUE_OFS(i) ((i) * sizeof(LONG))
  #define IOS_BUTTON_OFS(i) (IOS_VALUE_COUNT * sizeof(LONG) + (i))
  
@@ -15,7 +15,11 @@ index ee8342f..d1f45f3 100644
 + * Touchpad. A DirectInput game with its own map for a PlayStation pad (KINGDOM
 + * HEARTS HD 2.8 reads its pad only through DirectInput, and with the XUSB
 + * layout above every face button landed on the wrong action) finds the buttons
-+ * where that map expects them. The XUSB layout stays the default. */
++ * where that map expects them. The XUSB layout stays the default.
++ *
++ * The device keeps Madeira's own vendor/product IDs: with Sony's (054C:09CC)
++ * the same game stopped reading the pad at all, as a title does when it drives
++ * a DualShock 4 through raw HID rather than DirectInput. */
 +enum ios_ds4_index
 +{
 +    IOS_DS4_X = 0,
@@ -32,8 +36,6 @@ index ee8342f..d1f45f3 100644
 +#define IOS_DS4_BUTTON_OFS(i) (IOS_DS4_VALUE_COUNT * sizeof(LONG) + (i))
 +#define IOS_MAX_VALUES  IOS_DS4_VALUE_COUNT
 +#define IOS_MAX_BUTTONS 14
-+#define IOS_DS4_VID 0x054c
-+#define IOS_DS4_PID 0x09cc
 +
 +static int ios_dinput_layout = -1;   /* 0 XUSB (default), 1 DualShock 4 */
 +
@@ -54,7 +56,7 @@ index ee8342f..d1f45f3 100644
  struct ios_joystick
  {
      struct dinput_device base;
-@@ -266,6 +311,47 @@ static const struct ios_object ios_objects[IOS_OBJ_COUNT] =
+@@ -266,6 +313,47 @@ static const struct ios_object ios_objects[IOS_OBJ_COUNT] =
  #undef IOS_BUTTON
  };
  
@@ -102,7 +104,7 @@ index ee8342f..d1f45f3 100644
  static void ios_object_instance( const struct ios_object *object, DIDEVICEOBJECTINSTANCEW *instance )
  {
      memset( instance, 0, sizeof(*instance) );
-@@ -427,10 +513,53 @@ static LONG ios_logical_pov( WORD buttons )
+@@ -427,10 +515,53 @@ static LONG ios_logical_pov( WORD buttons )
      return 8;
  }
  
@@ -157,25 +159,7 @@ index ee8342f..d1f45f3 100644
      values[IOS_OBJ_X]   = ios_logical_stick( pad->sThumbLX );
      values[IOS_OBJ_Y]   = ios_logical_stick_inverted( pad->sThumbLY );
      values[IOS_OBJ_Z]   = ios_logical_triggers( pad->bLeftTrigger, pad->bRightTrigger );
-@@ -482,14 +611,15 @@ HRESULT ios_joystick_enum_device( DWORD type, DWORD flags, DIDEVICEINSTANCEW *in
-     instance->dwSize = size;
-     instance->guidInstance = ios_joystick_guid;
-     instance->guidProduct = dinput_pidvid_guid;
--    instance->guidProduct.Data1 = MAKELONG( IOS_JOYSTICK_VID, IOS_JOYSTICK_PID );
-+    instance->guidProduct.Data1 = ios_layout_ds4() ? MAKELONG( IOS_DS4_VID, IOS_DS4_PID )
-+                                                   : MAKELONG( IOS_JOYSTICK_VID, IOS_JOYSTICK_PID );
-     instance->guidFFDriver = GUID_NULL;     /* no force feedback: see the header comment */
-     if (version >= 0x0800) instance->dwDevType = DI8DEVTYPE_GAMEPAD | (DI8DEVTYPEGAMEPAD_STANDARD << 8);
-     else instance->dwDevType = DIDEVTYPE_JOYSTICK | (DIDEVTYPEJOYSTICK_GAMEPAD << 8);
-     instance->wUsagePage = HID_USAGE_PAGE_GENERIC;
-     instance->wUsage = HID_USAGE_GENERIC_GAMEPAD;
-     lstrcpynW( instance->tszInstanceName, L"Gamepad", MAX_PATH );
--    lstrcpynW( instance->tszProductName, L"Madeira Gamepad", MAX_PATH );
-+    lstrcpynW( instance->tszProductName, ios_layout_ds4() ? L"Wireless Controller" : L"Madeira Gamepad", MAX_PATH );
- 
-     /* Honour the same HKCU\Software\Wine\DirectInput\Joysticks disable list
-      * the HID path honours, so a title that has to be told to ignore a pad can
-@@ -531,9 +661,12 @@ static HRESULT ios_joystick_enum_objects( IDirectInputDevice8W *iface, const DIP
+@@ -531,9 +662,12 @@ static HRESULT ios_joystick_enum_objects( IDirectInputDevice8W *iface, const DIP
      DWORD i;
      BOOL ret;
  
@@ -190,7 +174,7 @@ index ee8342f..d1f45f3 100644
          ret = ios_try_enum_object( &impl->base, filter, flags, callback, i, &instance, context );
          if (ret != DIENUM_CONTINUE) return DIENUM_STOP;
      }
-@@ -581,6 +714,13 @@ static BOOL ios_init_object_properties( struct dinput_device *device, UINT index
+@@ -581,6 +715,13 @@ static BOOL ios_init_object_properties( struct dinput_device *device, UINT index
          properties->logical_min = -32768;
          properties->logical_max = 32767;
          properties->range_max = 65535;
@@ -204,7 +188,7 @@ index ee8342f..d1f45f3 100644
      }
      else /* the hat */
      {
-@@ -601,6 +741,7 @@ static BOOL ios_init_object_properties( struct dinput_device *device, UINT index
+@@ -601,6 +742,7 @@ static BOOL ios_init_object_properties( struct dinput_device *device, UINT index
  /* Object names for the trace below, index-aligned with enum ios_object_index
   * (buttons are excluded here: they get one combined bitmask, not one line each). */
  static const char *const ios_trace_axis_name[IOS_VALUE_COUNT] = { "X", "Y", "Z", "RX", "RY", "POV" };
@@ -212,7 +196,7 @@ index ee8342f..d1f45f3 100644
  
  /* Everything a device report about "which object is the game reading for its
   * camera, and what does it read at rest" needs, in one place, rate-limited.
-@@ -637,12 +778,15 @@ static const char *const ios_trace_axis_name[IOS_VALUE_COUNT] = { "X", "Y", "Z",
+@@ -637,12 +779,15 @@ static const char *const ios_trace_axis_name[IOS_VALUE_COUNT] = { "X", "Y", "Z",
   *                        DIDFT_OPTIONAL still set means the app's format never
   *                        matched it at all. */
  static void ios_joystick_trace( struct ios_joystick *impl, const XINPUT_GAMEPAD *pad,
@@ -230,7 +214,7 @@ index ee8342f..d1f45f3 100644
  
      /* Opt-in (MADEIRA_DINPUT_TRACE=1) and limited by a PROCESS-wide call
       * counter: the per-device millisecond limiter never engaged for a title
-@@ -655,20 +799,25 @@ static void ios_joystick_trace( struct ios_joystick *impl, const XINPUT_GAMEPAD
+@@ -655,20 +800,25 @@ static void ios_joystick_trace( struct ios_joystick *impl, const XINPUT_GAMEPAD
      if (InterlockedIncrement( &blocks ) > 200) return;
      (void)impl->last_trace_ms;
  
@@ -262,7 +246,7 @@ index ee8342f..d1f45f3 100644
      }
  
      if (!user_format->rgodf)
-@@ -677,13 +826,13 @@ static void ios_joystick_trace( struct ios_joystick *impl, const XINPUT_GAMEPAD
+@@ -677,13 +827,13 @@ static void ios_joystick_trace( struct ios_joystick *impl, const XINPUT_GAMEPAD
      {
          ERR( "[dinput] app format dwDataSize=%lu dwNumObjs=%lu\n",
                 user_format->dwDataSize, user_format->dwNumObjs );
@@ -279,7 +263,7 @@ index ee8342f..d1f45f3 100644
          }
      }
  }
-@@ -701,11 +850,12 @@ static void ios_joystick_trace( struct ios_joystick *impl, const XINPUT_GAMEPAD
+@@ -701,11 +851,12 @@ static void ios_joystick_trace( struct ios_joystick *impl, const XINPUT_GAMEPAD
  static void ios_joystick_sample( struct ios_joystick *impl, BOOL queue )
  {
      IDirectInputDevice8W *iface = &impl->base.IDirectInputDevice8W_iface;
@@ -295,7 +279,7 @@ index ee8342f..d1f45f3 100644
  
      if (!host_pad_state( impl->user_index, &state ))
      {
-@@ -725,24 +875,24 @@ static void ios_joystick_sample( struct ios_joystick *impl, BOOL queue )
+@@ -725,24 +876,24 @@ static void ios_joystick_sample( struct ios_joystick *impl, BOOL queue )
      time = GetCurrentTime();
      seq = impl->base.dinput->evsequence++;
  

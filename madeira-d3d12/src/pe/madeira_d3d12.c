@@ -1187,6 +1187,7 @@ struct mad_resource {
     LONG mapped;
     obj_handle_t texture;      /* set instead of `buffer` for TEXTURE2D */
     obj_handle_t nv12_chroma;  /* MADEIRA: an NV12 texture opened from Direct3D 11: its CbCr plane (RG8, half size); `texture` is the luma plane */
+    struct mad_resource *nv12_plane[2];   /* MADEIRA: the two planes as plain R8 / RG8 textures, what a copy of subresource 0 / 1 reads */
     UINT64 gpu_resource_id;    /* what a descriptor entry stores for a texture */
     UINT32 width, height;
     int is_depth;
@@ -20437,9 +20438,26 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
     struct mad_resource *d, *s;
     struct mad_cmd *c;
     UINT bytes, block;
+    D3D12_TEXTURE_COPY_LOCATION nv12_src;   /* MADEIRA: see below */
     if (!dst || !src) return;
     d = (struct mad_resource *)dst->pResource; s = (struct mad_resource *)src->pResource;
     if (!d || !s) return;
+    {   /* MADEIRA: a copy from an NV12 texture opened from Direct3D 11 names its plane by
+         * subresource (0 luma, 1 chroma); read the plane's own texture. Before, plane 1
+         * was read from the luma texture: chroma came out as the top half of the luma. */
+        if (s->nv12_chroma && src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+            UINT plane = src->SubresourceIndex ? 1 : 0;
+            if (s->nv12_plane[plane]) {
+                D3D12_TEXTURE_COPY_LOCATION *ns = &nv12_src;
+                D3D12_TEXTURE_COPY_LOCATION tmp = *src;
+                tmp.pResource = (ID3D12Resource *)s->nv12_plane[plane];
+                tmp.SubresourceIndex = 0;
+                *ns = tmp;
+                src = ns;
+                s = s->nv12_plane[plane];
+            }
+        }
+    }
     if (d->texture && !s->texture) {           /* upload: buffer -> texture */
         const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *f = &src->PlacedFootprint;
         UINT w, h, dd;
@@ -21025,6 +21043,25 @@ static HRESULT STDMETHODCALLTYPE device_OpenSharedHandle(ID3D12Device10 *This, H
     r->desc.DepthOrArraySize = 1; r->desc.MipLevels = 1;
     r->desc.Format = DXGI_FORMAT_NV12;
     r->desc.SampleDesc.Count = 1;
+    {   /* the planes as plain textures for CopyTextureRegion (subresource 0 = luma, 1 = chroma) */
+        unsigned k;
+        for (k = 0; k < 2; k++) {
+            struct mad_resource *pl = calloc(1, sizeof *pl);
+            if (!pl) continue;
+            pl->vtbl = &g_res_vtbl; pl->refs = 1; pl->iid = &IID_ID3D12Resource; pl->name = k ? "SharedNV12.CbCr" : "SharedNV12.Y";
+            pl->serial = (unsigned)InterlockedIncrement(&g_res_serial);
+            pl->heap = D3D12_HEAP_TYPE_DEFAULT; pl->owner = d; pl->borrowed = 1; pl->samples = 1;
+            pl->texture = k ? r->nv12_chroma : r->texture;
+            pl->gpu_resource_id = k ? tc.gpu_resource_id : ti.gpu_resource_id;
+            pl->width = k ? tc.width : ti.width; pl->height = k ? tc.height : ti.height;
+            pl->tex_type = WMTTextureType2D; pl->tex_pf = k ? WMTPixelFormatRG8Unorm : WMTPixelFormatR8Unorm;
+            pl->tex_mips = 1; pl->tex_layers = 1; pl->tex_depth = 1;
+            pl->desc = r->desc;
+            pl->desc.Width = pl->width; pl->desc.Height = pl->height;
+            pl->desc.Format = k ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM;
+            r->nv12_plane[k] = pl;   /* kept for the process, like the plane textures */
+        }
+    }
     mad_resident(d, si.buffer);
     mad_resident(d, r->texture);
     mad_resident(d, r->nv12_chroma);
