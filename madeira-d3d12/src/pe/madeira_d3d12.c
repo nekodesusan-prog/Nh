@@ -1827,6 +1827,16 @@ static int mad_list_type_ok(D3D12_COMMAND_LIST_TYPE t) {
     return t == D3D12_COMMAND_LIST_TYPE_DIRECT || t == D3D12_COMMAND_LIST_TYPE_COMPUTE ||
            t == D3D12_COMMAND_LIST_TYPE_COPY;
 }
+/* Allocators and lists also come as BUNDLE: a bundle records like any list and
+ * is replayed into a direct list by ExecuteBundle (no queue of that type). */
+static int mad_list_type_ok_rec(D3D12_COMMAND_LIST_TYPE t) {
+    return mad_list_type_ok(t) || t == D3D12_COMMAND_LIST_TYPE_BUNDLE;
+}
+static void mad_list_create_refused(const char *what, D3D12_COMMAND_LIST_TYPE t, const char *why) {
+    static LONG n;
+    if (InterlockedIncrement(&n) <= 16)
+        d3d12_log("[madeira-d3d12] %s refused: type %d, %s\n", what, t, why);
+}
 
 struct mad_alloc {
     ID3D12CommandAllocatorVtbl *vtbl;
@@ -2039,6 +2049,42 @@ static HRESULT STDMETHODCALLTYPE list_Reset(ID3D12GraphicsCommandList *This,
     memset(l->rec_tab, 0, sizeof l->rec_tab); memset(l->lat_va, 0, sizeof l->lat_va); memset(l->lat_data, 0, sizeof l->lat_data);
     mad_list_rings_rewind(l);   /* ml1061: only reuses chunks the GPU has finished with */
     return S_OK;
+}
+/* ExecuteBundle: append the bundle's recorded commands to this list, as if they
+ * had been recorded here. Commands that point into the bundle's constant words
+ * (root constants, static-CBV latches, clear rectangles) are rebased onto this
+ * list's copy of them; the resources the bundle reached are noted here too.
+ * State the bundle set carries on in the caller, as D3D12 specifies, so the
+ * static-CBV recording state follows it and the latch cache is dropped. */
+static void STDMETHODCALLTYPE list_ExecuteBundle(ID3D12GraphicsCommandList *This, ID3D12GraphicsCommandList *bundle) {
+    struct mad_list *l = (struct mad_list *)This, *b = (struct mad_list *)bundle;
+    static LONG logs;
+    unsigned i, base;
+    if (!b || l->closed || b == l) return;
+    if (InterlockedIncrement(&logs) <= 4)
+        d3d12_log("[madeira-d3d12] ExecuteBundle: %u command(s), %u constant word(s), type %d into type %d\n",
+                  b->ncmds, b->ncdata, b->type, l->type);
+    if (!b->ncmds) return;
+    if (b->ncdata && !mad_grow((void **)&l->cdata, &l->cdcap, l->ncdata + b->ncdata, sizeof *l->cdata)) return;
+    if (!mad_grow((void **)&l->cmds, &l->ccap, l->ncmds + b->ncmds, sizeof *l->cmds)) return;
+    base = l->ncdata;
+    if (b->ncdata) memcpy(&l->cdata[base], b->cdata, b->ncdata * sizeof *l->cdata);
+    l->ncdata += b->ncdata;
+    for (i = 0; i < b->ncmds; i++) {
+        struct mad_cmd *c = &l->cmds[l->ncmds++];
+        *c = b->cmds[i];
+        switch (c->kind) {
+        case MC_ROOT_CONST: case MC_CROOT_CONST: c->u.rconst.data += base; break;
+        case MC_CBV_LATCH: c->u.latch.data += base; break;
+        case MC_CLEAR_RT: case MC_CLEAR_DS: if (c->u.clear.nrect) c->u.clear.rect_at += base; break;
+        default: break;
+        }
+    }
+    for (i = 0; i < b->nused; i++) mad_list_note_used(l, b->used[i]);
+    for (i = 0; i < 2; i++)
+        if (b->rec_rs[i]) { l->rec_rs[i] = b->rec_rs[i]; memcpy(l->rec_tab[i], b->rec_tab[i], sizeof l->rec_tab[i]); }
+    if (b->rec_heap) l->rec_heap = b->rec_heap;
+    memset(l->lat_va, 0, sizeof l->lat_va); memset(l->lat_data, 0, sizeof l->lat_data);
 }
 static D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE list_GetType(ID3D12GraphicsCommandList *This) {
     (void)This;
@@ -12100,7 +12146,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandAllocator(ID3D12Device *Thi
         D3D12_COMMAND_LIST_TYPE type, REFIID riid, void **out) {
     (void)This;
     if (!out) return E_INVALIDARG;
-    if (!mad_list_type_ok(type)) return E_NOTIMPL;
+    if (!mad_list_type_ok_rec(type)) { mad_list_create_refused("CreateCommandAllocator", type, "type not implemented"); return E_NOTIMPL; }
     struct mad_alloc *a = calloc(1, sizeof *a);
     if (!a) return E_OUTOFMEMORY;
     a->type = type;
@@ -12114,9 +12160,12 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandList(ID3D12Device *This, UI
         D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator *allocator,
         ID3D12PipelineState *pso, REFIID riid, void **out) {
     (void)This; (void)node; (void)pso;
-    if (!out || !allocator) return E_INVALIDARG;
-    if (!mad_list_type_ok(type)) return E_NOTIMPL;
-    if (((struct mad_alloc *)allocator)->type != type) return E_INVALIDARG;
+    if (!out || !allocator) { mad_list_create_refused("CreateCommandList", type, "no allocator"); return E_INVALIDARG; }
+    if (!mad_list_type_ok_rec(type)) { mad_list_create_refused("CreateCommandList", type, "type not implemented"); return E_NOTIMPL; }
+    if (((struct mad_alloc *)allocator)->type != type) {
+        mad_list_create_refused("CreateCommandList", type, "allocator of another type");
+        return E_INVALIDARG;
+    }
     struct mad_list *l = calloc(1, sizeof *l);
     if (!l) return E_OUTOFMEMORY;
     l->type = type;
@@ -20857,8 +20906,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandList1(ID3D12Device10 *This,
         D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS flags, REFIID riid, void **out) {
     (void)node;
     if (!out) return E_INVALIDARG;
-    if (flags != D3D12_COMMAND_LIST_FLAG_NONE) return E_INVALIDARG;
-    if (!mad_list_type_ok(type)) return E_NOTIMPL;
+    if (flags != D3D12_COMMAND_LIST_FLAG_NONE) { mad_list_create_refused("CreateCommandList1", type, "flags"); return E_INVALIDARG; }
+    if (!mad_list_type_ok_rec(type)) { mad_list_create_refused("CreateCommandList1", type, "type not implemented"); return E_NOTIMPL; }
     struct mad_list *l = calloc(1, sizeof *l);
     if (!l) return E_OUTOFMEMORY;
     l->type = type;
@@ -21309,6 +21358,7 @@ static void build_vtables(void) {
     g_list_vtbl.AddRef                  = (void *)list_AddRef;
     g_list_vtbl.Release                 = (void *)list_Release;
     g_list_vtbl.Close                   = (void *)list_Close;
+    g_list_vtbl.ExecuteBundle           = (void *)list_ExecuteBundle;
     g_list_vtbl.Reset                   = (void *)list_Reset;
     g_list_vtbl.GetType                 = (void *)list_GetType;
     g_list_vtbl.CopyBufferRegion        = (void *)list_CopyBufferRegion;
