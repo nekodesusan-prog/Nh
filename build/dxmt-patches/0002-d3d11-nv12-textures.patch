@@ -1,3 +1,15 @@
+diff --git a/src/d3d11/d3d11.def b/src/d3d11/d3d11.def
+index b79deb7..4ac92a8 100644
+--- a/src/d3d11/d3d11.def
++++ b/src/d3d11/d3d11.def
+@@ -3,4 +3,5 @@ EXPORTS
+     D3D11CoreCreateDevice @18
+     D3D11CreateDevice @22
+     D3D11CreateDeviceAndSwapChain @23
+-    D3D11On12CreateDevice @24
+\ No newline at end of file
++    D3D11On12CreateDevice @24
++    MadeiraD3D11SharedTextureInfo
 diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
 index 7257ecf..51c527c 100644
 --- a/src/d3d11/d3d11_context_impl.cpp
@@ -71,10 +83,96 @@ index 83f36c0..ee03885 100644
    BytesPerRow = aligned_bytes_per_row;
    BytesPerImage = aligned_bytes_per_row * h;
 diff --git a/src/d3d11/d3d11_texture_linear.cpp b/src/d3d11/d3d11_texture_linear.cpp
-index 1de2d4b..5804dd8 100644
+index 1de2d4b..aeaa6df 100644
 --- a/src/d3d11/d3d11_texture_linear.cpp
 +++ b/src/d3d11/d3d11_texture_linear.cpp
-@@ -115,14 +115,35 @@ HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_2d>::CreateShaderRes
+@@ -1,4 +1,6 @@
+ #include "d3d11_private.h"
++#include <mutex>
++#include <type_traits>
+ #include "com/com_pointer.hpp"
+ #include "d3d11_device.hpp"
+ #include "dxmt_dynamic.hpp"
+@@ -9,6 +11,40 @@
+ 
+ namespace dxmt {
+ 
++/* MADEIRA: NV12 textures shared with madeira-d3d12 (same process). Media
++ * Foundation's frames are created on this device with a SHARED misc flag and
++ * the game opens them in its Direct3D 12 device (KINGDOM HEARTS Dream Drop
++ * Distance's movies). A shared NV12 texture gets a process-local handle;
++ * d3d12.dll asks MadeiraD3D11SharedTextureInfo (exported below) for the Metal
++ * buffer and layout behind it and samples the same memory. */
++struct MadeiraSharedTextureInfo {
++  uint64_t buffer;
++  uint32_t bytes_per_row, width, height, dxgi_format, options, reserved;
++};
++struct MadeiraSharedEntry {
++  Rc<Texture> texture;
++  uint32_t bytes_per_row, width, height, dxgi_format;
++};
++static constexpr uintptr_t kMadeiraSharedBase = 0x4d480000u;
++static constexpr unsigned kMadeiraSharedMax = 256;
++static std::mutex g_madeira_shared_lock;
++static MadeiraSharedEntry g_madeira_shared[kMadeiraSharedMax];
++static unsigned g_madeira_shared_count;
++
++static HANDLE
++MadeiraShareTexture(Texture *texture, uint32_t bytes_per_row, uint32_t width, uint32_t height, uint32_t format) {
++  std::lock_guard<std::mutex> lock(g_madeira_shared_lock);
++  unsigned i = 0;
++  for (; i < g_madeira_shared_count; i++)
++    if (g_madeira_shared[i].texture.ptr() == texture)
++      return (HANDLE)(kMadeiraSharedBase + (uintptr_t)(i << 2));
++  if (g_madeira_shared_count == kMadeiraSharedMax)
++    return nullptr;
++  g_madeira_shared[i] = {Rc<Texture>(texture), bytes_per_row, width, height, format};
++  g_madeira_shared_count++;
++  return (HANDLE)(kMadeiraSharedBase + (uintptr_t)(i << 2));
++}
++
+ #pragma region DynamicLinearTexture
+ 
+ template <typename tag_texture>
+@@ -89,6 +125,37 @@ TDynamicLinearTexture(
+   HRESULT
+   STDMETHODCALLTYPE
+   CreateShaderResourceView(const D3D11_SHADER_RESOURCE_VIEW_DESC1 *pDesc, ID3D11ShaderResourceView1 **ppView) override;
++
++  /* MADEIRA: see MadeiraShareTexture */
++  HRESULT
++  MadeiraShareHandle(HANDLE *pHandle) {
++    if (!pHandle)
++      return E_INVALIDARG;
++    *pHandle = nullptr;
++    if constexpr (std::is_same_v<tag_texture, tag_texture_2d>) {
++      constexpr UINT shared = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
++                              D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
++      if (this->desc.Format != DXGI_FORMAT_NV12 || !(this->desc.MiscFlags & shared))
++        return E_INVALIDARG;
++      *pHandle = MadeiraShareTexture(
++          texture_.ptr(), bytes_per_row_, this->desc.Width, this->desc.Height, this->desc.Format
++      );
++      return *pHandle ? S_OK : E_OUTOFMEMORY;
++    }
++    return E_INVALIDARG;
++  }
++
++  HRESULT
++  GetSharedHandle(HANDLE *pSharedHandle) override {
++    return MadeiraShareHandle(pSharedHandle);
++  }
++
++  HRESULT
++  CreateSharedHandle(const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName, HANDLE *pNTHandle)
++      override {
++    (void)Attributes; (void)Access; (void)pName;
++    return MadeiraShareHandle(pNTHandle);
++  }
+ };
+ 
+ template<>
+@@ -115,14 +182,35 @@ HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_2d>::CreateShaderRes
      return E_FAIL;
    }
  
@@ -113,7 +211,7 @@ index 1de2d4b..5804dd8 100644
  
    auto srv = ref(new SRV(&finalDesc, this, this->m_parent, view_key));
  
-@@ -205,6 +226,13 @@ CreateDynamicLinearTexture2D(
+@@ -205,6 +293,13 @@ CreateDynamicLinearTexture2D(
    if (FAILED(GetLinearTextureLayout(pDevice, finalDesc, 0, bytesPerRow, bytesPerImage, bufferLen))) {
      return E_FAIL;
    }
@@ -127,6 +225,34 @@ index 1de2d4b..5804dd8 100644
  
    *ppTexture = reinterpret_cast<ID3D11Texture2D1 *>(
        ref(new TDynamicLinearTexture<tag_texture_2d>(&finalDesc, info, pInitialData, bufferLen, bytesPerRow, pDevice))
+@@ -250,3 +345,27 @@ CreateDynamicLinearTexture1D(
+ }
+ 
+ } // namespace dxmt
++
++extern "C" __declspec(dllexport) BOOL WINAPI
++MadeiraD3D11SharedTextureInfo(HANDLE handle, dxmt::MadeiraSharedTextureInfo *info) {
++  using namespace dxmt;
++  uintptr_t h = (uintptr_t)handle;
++  if (!info || h < kMadeiraSharedBase || ((h - kMadeiraSharedBase) & 3))
++    return FALSE;
++  unsigned i = (unsigned)((h - kMadeiraSharedBase) >> 2);
++  std::lock_guard<std::mutex> lock(g_madeira_shared_lock);
++  if (i >= g_madeira_shared_count)
++    return FALSE;
++  auto &entry = g_madeira_shared[i];
++  auto *allocation = entry.texture->current();
++  if (!allocation || !allocation->buffer())
++    return FALSE;
++  info->buffer = (obj_handle_t)allocation->buffer();
++  info->bytes_per_row = entry.bytes_per_row;
++  info->width = entry.width;
++  info->height = entry.height;
++  info->dxgi_format = entry.dxgi_format;
++  info->options = (uint32_t)allocation->bufferTextureInfo().options;
++  info->reserved = 0;
++  return TRUE;
++}
 diff --git a/src/dxmt/dxmt_format.cpp b/src/dxmt/dxmt_format.cpp
 index ab83058..585bb33 100644
 --- a/src/dxmt/dxmt_format.cpp

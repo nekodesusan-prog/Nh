@@ -1186,6 +1186,7 @@ struct mad_resource {
     UINT64 gpu_address;        /* reported by the backend at creation */
     LONG mapped;
     obj_handle_t texture;      /* set instead of `buffer` for TEXTURE2D */
+    obj_handle_t nv12_chroma;  /* MADEIRA: an NV12 texture opened from Direct3D 11: its CbCr plane (RG8, half size); `texture` is the luma plane */
     UINT64 gpu_resource_id;    /* what a descriptor entry stores for a texture */
     UINT32 width, height;
     int is_depth;
@@ -16454,6 +16455,20 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
         memset(e, 0, sizeof *e);
         return;
     }
+    if (r->nv12_chroma && desc && (desc->Format == DXGI_FORMAT_R8G8_UNORM || desc->Format == DXGI_FORMAT_R8G8_UINT ||
+                                   (desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D && desc->Texture2D.PlaneSlice == 1) ||
+                                   (desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY && desc->Texture2DArray.PlaneSlice == 1))) {
+        /* MADEIRA: the CbCr plane of an NV12 texture opened from Direct3D 11 */
+        struct mad_device *dd = (struct mad_device *)This;
+        obj_handle_t keep_tex = r->texture; enum WMTPixelFormat keep_pf = r->tex_pf; UINT64 keep_id = r->gpu_resource_id;
+        r->texture = r->nv12_chroma; r->tex_pf = WMTPixelFormatRG8Unorm; r->gpu_resource_id = 0;
+        e->texture_view_id = mad_texture_view_id(dd, r, WMTTextureType2DArray, 0, 1, 0, 1, WMTPixelFormatRG8Unorm, 0);
+        r->texture = keep_tex; r->tex_pf = keep_pf; r->gpu_resource_id = keep_id;
+        e->gpu_va = 0;
+        e->metadata = 0;
+        mad_view_list_add(dd, 0, r);
+        return;
+    }
     float min_lod = 0.0f;
     UINT32 lod_bits;
     UINT64 view_id = r->gpu_resource_id;
@@ -20944,11 +20959,84 @@ static void STDMETHODCALLTYPE device_RemoveDevice(ID3D12Device10 *This) {
  * Distance opens its Direct3D 11 movie frames here) is not implemented. The
  * generated stub returned E_NOTIMPL without clearing *object, and the game
  * then used whatever the caller's variable held: a crash at d3d12+0x5e554. */
+/* MADEIRA: an NV12 texture of DXMT's Direct3D 11 device (Media Foundation's
+ * decoded movie frames) is the one kind of shared resource that can be opened:
+ * DXMT keeps it in a Metal buffer (luma rows, then CbCr rows, one row pitch)
+ * and answers d3d11.dll!MadeiraD3D11SharedTextureInfo for its handle. The
+ * resource made here samples that same memory: `texture` is the luma plane
+ * (R8), nv12_chroma the CbCr plane (RG8); a plane-1 or R8G8 SRV picks the
+ * second. There is no cross-queue synchronization: the frame Direct3D 11 wrote
+ * is read when Direct3D 12 next samples it. */
+struct mad_d3d11_shared_info { UINT64 buffer; UINT32 bytes_per_row, width, height, dxgi_format, options, reserved; };
+typedef BOOL (WINAPI *mad_d3d11_shared_fn)(HANDLE, struct mad_d3d11_shared_info *);
 static HRESULT STDMETHODCALLTYPE device_OpenSharedHandle(ID3D12Device10 *This, HANDLE handle, REFIID riid, void **object) {
-    (void)This; (void)handle; (void)riid;
-    madeira_d3d12_note_unimplemented("ID3D12Device10", "OpenSharedHandle");
+    static mad_d3d11_shared_fn fn; static LONG looked;
+    struct mad_device *d = (struct mad_device *)This;
+    struct mad_d3d11_shared_info si;
+    struct mad_resource *r;
+    struct WMTTextureInfo ti, tc;
+    HRESULT hr;
+    static LONG said;
     if (object) *object = NULL;
-    return E_NOTIMPL;
+    if (!InterlockedExchange(&looked, 1)) {
+        HMODULE m = GetModuleHandleW(L"d3d11.dll");
+        fn = m ? (mad_d3d11_shared_fn)GetProcAddress(m, "MadeiraD3D11SharedTextureInfo") : NULL;
+    }
+    memset(&si, 0, sizeof si);
+    if (!fn || !fn(handle, &si) || si.dxgi_format != DXGI_FORMAT_NV12 || !si.buffer || !si.width || !si.height) {
+        if (InterlockedIncrement(&said) <= 8)
+            d3d12_log("[madeira-d3d12] OpenSharedHandle %p: not a Direct3D 11 NV12 texture (d3d11 export %s); refused\n",
+                      handle, fn ? "present" : "absent");
+        madeira_d3d12_note_unimplemented("ID3D12Device10", "OpenSharedHandle");
+        return E_NOTIMPL;
+    }
+    r = calloc(1, sizeof *r);
+    if (!r) return E_OUTOFMEMORY;
+    memset(&ti, 0, sizeof ti);
+    ti.pixel_format = WMTPixelFormatR8Unorm;
+    ti.width = si.width; ti.height = si.height; ti.depth = 1; ti.array_length = 1;
+    ti.type = WMTTextureType2D; ti.mipmap_level_count = 1; ti.sample_count = 1;
+    ti.usage = WMTTextureUsageShaderRead;
+    ti.options = (enum WMTResourceOptions)si.options;
+    tc = ti;
+    tc.pixel_format = WMTPixelFormatRG8Unorm;
+    tc.width = (si.width + 1) / 2; tc.height = (si.height + 1) / 2;
+    r->texture = MTLBuffer_newTexture(si.buffer, &ti, 0, si.bytes_per_row);
+    r->nv12_chroma = MTLBuffer_newTexture(si.buffer, &tc, (uint64_t)si.bytes_per_row * si.height, si.bytes_per_row);
+    if (!r->texture || !r->nv12_chroma) {
+        if (r->texture) NSObject_release(r->texture);
+        if (r->nv12_chroma) NSObject_release(r->nv12_chroma);
+        free(r);
+        d3d12_log("[madeira-d3d12] OpenSharedHandle: NV12 %ux%u planes could not be made on the Direct3D 11 buffer\n", si.width, si.height);
+        return E_FAIL;
+    }
+    r->vtbl = &g_res_vtbl; r->refs = 1; r->iid = &IID_ID3D12Resource; r->name = "SharedNV12";
+    r->serial = (unsigned)InterlockedIncrement(&g_res_serial);
+    r->heap = D3D12_HEAP_TYPE_DEFAULT;
+    r->owner = d;
+    r->borrowed = 1;   /* its memory is Direct3D 11's; the two plane textures stay for the process */
+    r->gpu_resource_id = ti.gpu_resource_id;
+    r->width = si.width; r->height = si.height;
+    r->tex_type = WMTTextureType2D; r->tex_pf = WMTPixelFormatR8Unorm; r->tex_mips = 1; r->tex_layers = 1; r->tex_depth = 1;
+    r->samples = 1;
+    memset(&r->desc, 0, sizeof r->desc);
+    r->desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    r->desc.Width = si.width; r->desc.Height = si.height;
+    r->desc.DepthOrArraySize = 1; r->desc.MipLevels = 1;
+    r->desc.Format = DXGI_FORMAT_NV12;
+    r->desc.SampleDesc.Count = 1;
+    mad_resident(d, si.buffer);
+    mad_resident(d, r->texture);
+    mad_resident(d, r->nv12_chroma);
+    EnterCriticalSection(&d->view_lock);
+    mad_vmap_put_locked(d, r->gpu_resource_id, 1, 0);
+    LeaveCriticalSection(&d->view_lock);
+    if (InterlockedIncrement(&said) <= 8)
+        d3d12_log("[madeira-d3d12] OpenSharedHandle %p: Direct3D 11 NV12 %ux%u (row %u bytes) opened as r#%u\n",
+                  handle, si.width, si.height, si.bytes_per_row, r->serial);
+    hr = res_QI((ID3D12Resource *)r, riid, object);
+    res_Release((ID3D12Resource *)r);
+    return hr;
 }
 static HRESULT STDMETHODCALLTYPE device_GetDeviceRemovedReason(ID3D12Device10 *This) {
     return ((struct mad_device *)This)->device_lost ? DXGI_ERROR_DEVICE_REMOVED : S_OK;
