@@ -9610,7 +9610,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     }
     case MC_COPY_T2T: {
         struct wmtcmd_blit_copy_from_texture_to_texture k;
-        if (!c->u.tt.dst->texture || !c->u.tt.src->texture) { MAD_SKIP(e); return; }
+        if (!c->u.tt.dst->texture || !c->u.tt.src->texture || !c->u.tt.w || !c->u.tt.h) { MAD_SKIP(e); return; }
         if ((c->u.tt.src->is_depth || c->u.tt.dst->is_depth) &&
             (c->u.tt.src->tex_pf != c->u.tt.dst->tex_pf || c->u.tt.splane || c->u.tt.dplane)) {
             exec_copy_aspect(e, c);   /* a depth or stencil plane to or from a colour texture */
@@ -20439,6 +20439,7 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
     struct mad_cmd *c;
     UINT bytes, block;
     D3D12_TEXTURE_COPY_LOCATION nv12_src;   /* MADEIRA: see below */
+    D3D12_BOX nv12_box;
     if (!dst || !src) return;
     d = (struct mad_resource *)dst->pResource; s = (struct mad_resource *)src->pResource;
     if (!d || !s) return;
@@ -20455,6 +20456,24 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
                 *ns = tmp;
                 src = ns;
                 s = s->nv12_plane[plane];
+                /* A chroma box given in luma units (1920x1080 for a 960x540 plane)
+                 * reads outside the plane and Metal dropped the copy: chroma stayed
+                 * zero and the movie came out green. Halve it, then clamp. */
+                if (box) {
+                    static LONG said_box;
+                    nv12_box = *box;
+                    if (plane && (nv12_box.right > s->width || nv12_box.bottom > s->height)) {
+                        nv12_box.left /= 2; nv12_box.top /= 2; nv12_box.right = (nv12_box.right + 1) / 2; nv12_box.bottom = (nv12_box.bottom + 1) / 2;
+                    }
+                    if (nv12_box.right > s->width) nv12_box.right = s->width;
+                    if (nv12_box.bottom > s->height) nv12_box.bottom = s->height;
+                    if (InterlockedIncrement(&said_box) <= 4)
+                        d3d12_log("[madeira-d3d12] NV12 plane %u copy: box %u,%u-%u,%u -> %u,%u-%u,%u, to '%s' %ux%u at %u,%u\n", plane,
+                                  box->left, box->top, box->right, box->bottom, nv12_box.left, nv12_box.top, nv12_box.right, nv12_box.bottom,
+                                  d->name ? d->name : "?", (unsigned)d->width, (unsigned)d->height, x, y);
+                    box = &nv12_box;
+                    if (box->left >= box->right || box->top >= box->bottom) return;
+                }
             }
         }
     }
@@ -20517,6 +20536,15 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
         c->u.tt.w = w; c->u.tt.h = h; c->u.tt.d = dd;
         if (box) { c->u.tt.sx = box->left; c->u.tt.sy = box->top; c->u.tt.sz = box->front;
                    c->u.tt.w = box->right - box->left; c->u.tt.h = box->bottom - box->top; c->u.tt.d = box->back - box->front; }
+        if (s->nv12_chroma || (s->name && !strncmp(s->name, "SharedNV12", 10))) {
+            /* MADEIRA: keep a shared-NV12 plane copy inside both textures (Metal drops one that is not) */
+            UINT dw, dh, ddd;
+            mad_mip_dims(d, c->u.tt.dlevel, &dw, &dh, &ddd);
+            if (c->u.tt.dx + c->u.tt.w > dw) c->u.tt.w = dw > c->u.tt.dx ? dw - c->u.tt.dx : 0;
+            if (c->u.tt.dy + c->u.tt.h > dh) c->u.tt.h = dh > c->u.tt.dy ? dh - c->u.tt.dy : 0;
+            if (c->u.tt.sx + c->u.tt.w > w) c->u.tt.w = w > c->u.tt.sx ? w - c->u.tt.sx : 0;
+            if (c->u.tt.sy + c->u.tt.h > h) c->u.tt.h = h > c->u.tt.sy ? h - c->u.tt.sy : 0;
+        }
         return;
     }
     list_CopyBufferRegion(This, dst->pResource, 0, src->pResource, 0, s->size < d->size ? s->size : d->size);
