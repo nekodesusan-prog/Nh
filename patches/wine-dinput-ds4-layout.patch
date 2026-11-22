@@ -1,0 +1,330 @@
+diff --git a/dlls/dinput/joystick_ios.c b/dlls/dinput/joystick_ios.c
+index ee8342f..d1f45f3 100644
+--- a/dlls/dinput/joystick_ios.c
++++ b/dlls/dinput/joystick_ios.c
+@@ -199,6 +199,51 @@ enum ios_object_index
+ #define IOS_VALUE_OFS(i) ((i) * sizeof(LONG))
+ #define IOS_BUTTON_OFS(i) (IOS_VALUE_COUNT * sizeof(LONG) + (i))
+ 
++/* MADEIRA: the DualShock 4 layout (MADEIRA_DINPUT_LAYOUT=ds4).
++ *
++ * What Windows' HID class driver reports for a DualShock 4 (054C:09CC) with
++ * no Steam Input in between: X/Y the left stick, Z/Rz the right stick, Rx/Ry
++ * the L2/R2 triggers resting at their minimum, a hat, and 14 buttons in the
++ * order Square Cross Circle Triangle L1 R1 L2 R2 Share Options L3 R3 PS
++ * Touchpad. A DirectInput game with its own map for a PlayStation pad (KINGDOM
++ * HEARTS HD 2.8 reads its pad only through DirectInput, and with the XUSB
++ * layout above every face button landed on the wrong action) finds the buttons
++ * where that map expects them. The XUSB layout stays the default. */
++enum ios_ds4_index
++{
++    IOS_DS4_X = 0,
++    IOS_DS4_Y,
++    IOS_DS4_Z,
++    IOS_DS4_RX,
++    IOS_DS4_RY,
++    IOS_DS4_RZ,
++    IOS_DS4_POV,
++    IOS_DS4_BUTTON_0,
++    IOS_DS4_COUNT = IOS_DS4_BUTTON_0 + 14,
++};
++#define IOS_DS4_VALUE_COUNT  (IOS_DS4_POV + 1)
++#define IOS_DS4_BUTTON_OFS(i) (IOS_DS4_VALUE_COUNT * sizeof(LONG) + (i))
++#define IOS_MAX_VALUES  IOS_DS4_VALUE_COUNT
++#define IOS_MAX_BUTTONS 14
++#define IOS_DS4_VID 0x054c
++#define IOS_DS4_PID 0x09cc
++
++static int ios_dinput_layout = -1;   /* 0 XUSB (default), 1 DualShock 4 */
++
++static BOOL ios_layout_ds4( void )
++{
++    int v = __atomic_load_n( &ios_dinput_layout, __ATOMIC_RELAXED );
++
++    if (v < 0)
++    {
++        const char *e = getenv( "MADEIRA_DINPUT_LAYOUT" );
++        v = (e && !strcasecmp( e, "ds4" )) ? 1 : 0;
++        __atomic_store_n( &ios_dinput_layout, v, __ATOMIC_RELAXED );
++        if (v) ERR( "[dinput] iOS joystick presented as a DualShock 4 (MADEIRA_DINPUT_LAYOUT=ds4)\n" );
++    }
++    return v;
++}
++
+ struct ios_joystick
+ {
+     struct dinput_device base;
+@@ -266,6 +311,47 @@ static const struct ios_object ios_objects[IOS_OBJ_COUNT] =
+ #undef IOS_BUTTON
+ };
+ 
++static const struct ios_object ios_objects_ds4[IOS_DS4_COUNT] =
++{
++#define IOS_AXIS( ofs_index, type_index, guid, usage, name )                                  \
++    { guid, IOS_VALUE_OFS( ofs_index ), DIDFT_ABSAXIS | DIDFT_MAKEINSTANCE( type_index ),     \
++      DIDOI_ASPECTPOSITION, HID_USAGE_PAGE_GENERIC, usage, name }
++    IOS_AXIS( IOS_DS4_X,  0, &GUID_XAxis,  HID_USAGE_GENERIC_X,  L"X Axis" ),
++    IOS_AXIS( IOS_DS4_Y,  1, &GUID_YAxis,  HID_USAGE_GENERIC_Y,  L"Y Axis" ),
++    IOS_AXIS( IOS_DS4_Z,  2, &GUID_ZAxis,  HID_USAGE_GENERIC_Z,  L"Z Axis" ),
++    IOS_AXIS( IOS_DS4_RX, 3, &GUID_RxAxis, HID_USAGE_GENERIC_RX, L"X Rotation" ),
++    IOS_AXIS( IOS_DS4_RY, 4, &GUID_RyAxis, HID_USAGE_GENERIC_RY, L"Y Rotation" ),
++    IOS_AXIS( IOS_DS4_RZ, 5, &GUID_RzAxis, HID_USAGE_GENERIC_RZ, L"Z Rotation" ),
++#undef IOS_AXIS
++    { &GUID_POV, IOS_VALUE_OFS( IOS_DS4_POV ), DIDFT_POV | DIDFT_MAKEINSTANCE( 0 ),
++      0, HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_HATSWITCH, L"Hat Switch" },
++#define IOS_BUTTON( n, name )                                                                 \
++    { &GUID_Button, IOS_DS4_BUTTON_OFS( n ), DIDFT_PSHBUTTON | DIDFT_MAKEINSTANCE( n ),       \
++      0, HID_USAGE_PAGE_BUTTON, (n) + 1, name }
++    IOS_BUTTON( 0, L"Button 0" ), IOS_BUTTON( 1, L"Button 1" ), IOS_BUTTON( 2, L"Button 2" ),
++    IOS_BUTTON( 3, L"Button 3" ), IOS_BUTTON( 4, L"Button 4" ), IOS_BUTTON( 5, L"Button 5" ),
++    IOS_BUTTON( 6, L"Button 6" ), IOS_BUTTON( 7, L"Button 7" ), IOS_BUTTON( 8, L"Button 8" ),
++    IOS_BUTTON( 9, L"Button 9" ), IOS_BUTTON( 10, L"Button 10" ), IOS_BUTTON( 11, L"Button 11" ),
++    IOS_BUTTON( 12, L"Button 12" ), IOS_BUTTON( 13, L"Button 13" ),
++#undef IOS_BUTTON
++};
++
++/* The table in use, and its value / button counts. */
++static const struct ios_object *ios_table( UINT *count, UINT *values, UINT *buttons )
++{
++    if (ios_layout_ds4())
++    {
++        if (count) *count = IOS_DS4_COUNT;
++        if (values) *values = IOS_DS4_VALUE_COUNT;
++        if (buttons) *buttons = 14;
++        return ios_objects_ds4;
++    }
++    if (count) *count = IOS_OBJ_COUNT;
++    if (values) *values = IOS_VALUE_COUNT;
++    if (buttons) *buttons = 10;
++    return ios_objects;
++}
++
+ static void ios_object_instance( const struct ios_object *object, DIDEVICEOBJECTINSTANCEW *instance )
+ {
+     memset( instance, 0, sizeof(*instance) );
+@@ -427,10 +513,53 @@ static LONG ios_logical_pov( WORD buttons )
+     return 8;
+ }
+ 
+-static void ios_logical_state( const XINPUT_GAMEPAD *pad, LONG values[IOS_VALUE_COUNT], BYTE buttons[10] )
++/* DS4: a trigger is its own axis, 0..255, resting at the minimum as on the
++ * real pad; L2/R2 are also buttons 6/7, pressed past a small threshold. */
++static void ios_logical_state_ds4( const XINPUT_GAMEPAD *pad, LONG values[IOS_MAX_VALUES], BYTE buttons[IOS_MAX_BUTTONS] )
++{
++    static const WORD mask[IOS_MAX_BUTTONS] =
++    {
++        XINPUT_GAMEPAD_X,               /* 0 Square   */
++        XINPUT_GAMEPAD_A,               /* 1 Cross    */
++        XINPUT_GAMEPAD_B,               /* 2 Circle   */
++        XINPUT_GAMEPAD_Y,               /* 3 Triangle */
++        XINPUT_GAMEPAD_LEFT_SHOULDER,   /* 4 L1       */
++        XINPUT_GAMEPAD_RIGHT_SHOULDER,  /* 5 R1       */
++        0,                              /* 6 L2: from the trigger */
++        0,                              /* 7 R2: from the trigger */
++        XINPUT_GAMEPAD_BACK,            /* 8 Share    */
++        XINPUT_GAMEPAD_START,           /* 9 Options  */
++        XINPUT_GAMEPAD_LEFT_THUMB,      /* 10 L3      */
++        XINPUT_GAMEPAD_RIGHT_THUMB,     /* 11 R3      */
++        0x0400,                         /* 12 PS: the guide bit, when the host reports it */
++        0,                              /* 13 Touchpad: not reported */
++    };
++    UINT i;
++
++    values[IOS_DS4_X]   = ios_logical_stick( pad->sThumbLX );
++    values[IOS_DS4_Y]   = ios_logical_stick_inverted( pad->sThumbLY );
++    values[IOS_DS4_Z]   = ios_logical_stick( pad->sThumbRX );
++    values[IOS_DS4_RX]  = pad->bLeftTrigger;
++    values[IOS_DS4_RY]  = pad->bRightTrigger;
++    values[IOS_DS4_RZ]  = ios_logical_stick_inverted( pad->sThumbRY );
++    values[IOS_DS4_POV] = ios_logical_pov( pad->wButtons );
++
++    for (i = 0; i < IOS_MAX_BUTTONS; ++i)
++        buttons[i] = (mask[i] && (pad->wButtons & mask[i])) ? 0x80 : 0x00;
++    buttons[6] = pad->bLeftTrigger > 30 ? 0x80 : 0x00;
++    buttons[7] = pad->bRightTrigger > 30 ? 0x80 : 0x00;
++}
++
++static void ios_logical_state( const XINPUT_GAMEPAD *pad, LONG values[IOS_MAX_VALUES], BYTE buttons[IOS_MAX_BUTTONS] )
+ {
+     UINT i;
+ 
++    if (ios_layout_ds4())
++    {
++        ios_logical_state_ds4( pad, values, buttons );
++        return;
++    }
++
+     values[IOS_OBJ_X]   = ios_logical_stick( pad->sThumbLX );
+     values[IOS_OBJ_Y]   = ios_logical_stick_inverted( pad->sThumbLY );
+     values[IOS_OBJ_Z]   = ios_logical_triggers( pad->bLeftTrigger, pad->bRightTrigger );
+@@ -482,14 +611,15 @@ HRESULT ios_joystick_enum_device( DWORD type, DWORD flags, DIDEVICEINSTANCEW *in
+     instance->dwSize = size;
+     instance->guidInstance = ios_joystick_guid;
+     instance->guidProduct = dinput_pidvid_guid;
+-    instance->guidProduct.Data1 = MAKELONG( IOS_JOYSTICK_VID, IOS_JOYSTICK_PID );
++    instance->guidProduct.Data1 = ios_layout_ds4() ? MAKELONG( IOS_DS4_VID, IOS_DS4_PID )
++                                                   : MAKELONG( IOS_JOYSTICK_VID, IOS_JOYSTICK_PID );
+     instance->guidFFDriver = GUID_NULL;     /* no force feedback: see the header comment */
+     if (version >= 0x0800) instance->dwDevType = DI8DEVTYPE_GAMEPAD | (DI8DEVTYPEGAMEPAD_STANDARD << 8);
+     else instance->dwDevType = DIDEVTYPE_JOYSTICK | (DIDEVTYPEJOYSTICK_GAMEPAD << 8);
+     instance->wUsagePage = HID_USAGE_PAGE_GENERIC;
+     instance->wUsage = HID_USAGE_GENERIC_GAMEPAD;
+     lstrcpynW( instance->tszInstanceName, L"Gamepad", MAX_PATH );
+-    lstrcpynW( instance->tszProductName, L"Madeira Gamepad", MAX_PATH );
++    lstrcpynW( instance->tszProductName, ios_layout_ds4() ? L"Wireless Controller" : L"Madeira Gamepad", MAX_PATH );
+ 
+     /* Honour the same HKCU\Software\Wine\DirectInput\Joysticks disable list
+      * the HID path honours, so a title that has to be told to ignore a pad can
+@@ -531,9 +661,12 @@ static HRESULT ios_joystick_enum_objects( IDirectInputDevice8W *iface, const DIP
+     DWORD i;
+     BOOL ret;
+ 
+-    for (i = 0; i < ARRAY_SIZE(ios_objects); ++i)
++    UINT count;
++    const struct ios_object *table = ios_table( &count, NULL, NULL );
++
++    for (i = 0; i < count; ++i)
+     {
+-        ios_object_instance( ios_objects + i, &instance );
++        ios_object_instance( table + i, &instance );
+         ret = ios_try_enum_object( &impl->base, filter, flags, callback, i, &instance, context );
+         if (ret != DIENUM_CONTINUE) return DIENUM_STOP;
+     }
+@@ -581,6 +714,13 @@ static BOOL ios_init_object_properties( struct dinput_device *device, UINT index
+         properties->logical_min = -32768;
+         properties->logical_max = 32767;
+         properties->range_max = 65535;
++        /* DS4 triggers (Rx/Ry there): 0..255 resting at the minimum, as the pad reports them */
++        if (ios_layout_ds4() && (instance->wUsage == HID_USAGE_GENERIC_RX || instance->wUsage == HID_USAGE_GENERIC_RY))
++        {
++            properties->bit_size = 8;
++            properties->logical_min = 0;
++            properties->logical_max = 255;
++        }
+     }
+     else /* the hat */
+     {
+@@ -601,6 +741,7 @@ static BOOL ios_init_object_properties( struct dinput_device *device, UINT index
+ /* Object names for the trace below, index-aligned with enum ios_object_index
+  * (buttons are excluded here: they get one combined bitmask, not one line each). */
+ static const char *const ios_trace_axis_name[IOS_VALUE_COUNT] = { "X", "Y", "Z", "RX", "RY", "POV" };
++static const char *const ios_trace_axis_name_ds4[IOS_DS4_VALUE_COUNT] = { "X", "Y", "Z", "RX", "RY", "RZ", "POV" };
+ 
+ /* Everything a device report about "which object is the game reading for its
+  * camera, and what does it read at rest" needs, in one place, rate-limited.
+@@ -637,12 +778,15 @@ static const char *const ios_trace_axis_name[IOS_VALUE_COUNT] = { "X", "Y", "Z",
+  *                        DIDFT_OPTIONAL still set means the app's format never
+  *                        matched it at all. */
+ static void ios_joystick_trace( struct ios_joystick *impl, const XINPUT_GAMEPAD *pad,
+-                                const LONG scaled[IOS_VALUE_COUNT], const BYTE buttons[10] )
++                                const LONG scaled[IOS_MAX_VALUES], const BYTE buttons[IOS_MAX_BUTTONS] )
+ {
+     const DIDATAFORMAT *user_format = &impl->base.user_format;
+     static LONG trace_on = -1, calls, blocks;
+     DWORD btn = 0;
+-    UINT i;
++    UINT i, nvalues, nbuttons;
++    const char *const *names = ios_layout_ds4() ? ios_trace_axis_name_ds4 : ios_trace_axis_name;
++
++    ios_table( NULL, &nvalues, &nbuttons );
+ 
+     /* Opt-in (MADEIRA_DINPUT_TRACE=1) and limited by a PROCESS-wide call
+      * counter: the per-device millisecond limiter never engaged for a title
+@@ -655,20 +799,25 @@ static void ios_joystick_trace( struct ios_joystick *impl, const XINPUT_GAMEPAD
+     if (InterlockedIncrement( &blocks ) > 200) return;
+     (void)impl->last_trace_ms;
+ 
+-    for (i = 0; i < ARRAY_SIZE(ios_button_mask); ++i) if (buttons[i]) btn |= 1u << i;
++    for (i = 0; i < nbuttons; ++i) if (buttons[i]) btn |= 1u << i;
+ 
+-    ERR( "[dinput] state x=%ld y=%ld z=%ld rx=%ld ry=%ld pov=%ld btn=0x%03lx\n",
+-           scaled[IOS_OBJ_X], scaled[IOS_OBJ_Y], scaled[IOS_OBJ_Z],
+-           scaled[IOS_OBJ_RX], scaled[IOS_OBJ_RY], scaled[IOS_OBJ_POV], btn );
++    if (nvalues == IOS_DS4_VALUE_COUNT)
++        ERR( "[dinput] state ds4 x=%ld y=%ld z=%ld rx=%ld ry=%ld rz=%ld pov=%ld btn=0x%04lx\n",
++               scaled[IOS_DS4_X], scaled[IOS_DS4_Y], scaled[IOS_DS4_Z], scaled[IOS_DS4_RX],
++               scaled[IOS_DS4_RY], scaled[IOS_DS4_RZ], scaled[IOS_DS4_POV], btn );
++    else
++        ERR( "[dinput] state x=%ld y=%ld z=%ld rx=%ld ry=%ld pov=%ld btn=0x%03lx\n",
++               scaled[IOS_OBJ_X], scaled[IOS_OBJ_Y], scaled[IOS_OBJ_Z],
++               scaled[IOS_OBJ_RX], scaled[IOS_OBJ_RY], scaled[IOS_OBJ_POV], btn );
+     ERR( "[dinput] raw lx=%d ly=%d rx=%d ry=%d lt=%u rt=%u buttons=0x%04x\n",
+            pad->sThumbLX, pad->sThumbLY, pad->sThumbRX, pad->sThumbRY,
+            pad->bLeftTrigger, pad->bRightTrigger, pad->wButtons );
+ 
+-    for (i = 0; i < IOS_VALUE_COUNT; ++i)
++    for (i = 0; i < nvalues; ++i)
+     {
+         const struct object_properties *p = impl->base.object_properties + i;
+         ERR( "[dinput] app set range obj=%s min=%ld max=%ld deadzone=%lu saturation=%lu\n",
+-               ios_trace_axis_name[i], p->range_min, p->range_max, p->deadzone, p->saturation );
++               names[i], p->range_min, p->range_max, p->deadzone, p->saturation );
+     }
+ 
+     if (!user_format->rgodf)
+@@ -677,13 +826,13 @@ static void ios_joystick_trace( struct ios_joystick *impl, const XINPUT_GAMEPAD
+     {
+         ERR( "[dinput] app format dwDataSize=%lu dwNumObjs=%lu\n",
+                user_format->dwDataSize, user_format->dwNumObjs );
+-        for (i = 0; i < IOS_VALUE_COUNT; ++i)
++        for (i = 0; i < nvalues; ++i)
+         {
+             const DIOBJECTDATAFORMAT *obj = user_format->rgodf + i;
+             if (obj->dwType & DIDFT_OPTIONAL)
+-                ERR( "[dinput] app format obj=%s unset\n", ios_trace_axis_name[i] );
++                ERR( "[dinput] app format obj=%s unset\n", names[i] );
+             else
+-                ERR( "[dinput] app format obj=%s ofs=%lu\n", ios_trace_axis_name[i], obj->dwOfs );
++                ERR( "[dinput] app format obj=%s ofs=%lu\n", names[i], obj->dwOfs );
+         }
+     }
+ }
+@@ -701,11 +850,12 @@ static void ios_joystick_trace( struct ios_joystick *impl, const XINPUT_GAMEPAD
+ static void ios_joystick_sample( struct ios_joystick *impl, BOOL queue )
+ {
+     IDirectInputDevice8W *iface = &impl->base.IDirectInputDevice8W_iface;
+-    LONG values[IOS_VALUE_COUNT], scaled[IOS_VALUE_COUNT], value, old_value;
++    LONG values[IOS_MAX_VALUES], scaled[IOS_MAX_VALUES], value, old_value;
+     XINPUT_STATE state;
+-    BYTE buttons[10];
++    BYTE buttons[IOS_MAX_BUTTONS];
+     DWORD time, seq;
+-    UINT i;
++    UINT i, nvalues, nbuttons;
++    const struct ios_object *table = ios_table( NULL, &nvalues, &nbuttons );
+ 
+     if (!host_pad_state( impl->user_index, &state ))
+     {
+@@ -725,24 +875,24 @@ static void ios_joystick_sample( struct ios_joystick *impl, BOOL queue )
+     time = GetCurrentTime();
+     seq = impl->base.dinput->evsequence++;
+ 
+-    for (i = 0; i < IOS_VALUE_COUNT; ++i)
++    for (i = 0; i < nvalues; ++i)
+     {
+         const struct object_properties *properties = impl->base.object_properties + i;
+-        if (ios_objects[i].dwType & DIDFT_AXIS) value = ios_scale_axis_value( values[i], properties );
++        if (table[i].dwType & DIDFT_AXIS) value = ios_scale_axis_value( values[i], properties );
+         else value = ios_scale_value( values[i], properties );
+ 
+-        old_value = *(LONG *)(impl->base.device_state + ios_objects[i].dwOfs);
+-        *(LONG *)(impl->base.device_state + ios_objects[i].dwOfs) = value;
++        old_value = *(LONG *)(impl->base.device_state + table[i].dwOfs);
++        *(LONG *)(impl->base.device_state + table[i].dwOfs) = value;
+         scaled[i] = value;
+         if (queue && old_value != value) queue_event( iface, i, value, time, seq );
+     }
+ 
+-    for (i = 0; i < ARRAY_SIZE(buttons); ++i)
++    for (i = 0; i < nbuttons; ++i)
+     {
+-        UINT index = IOS_OBJ_BUTTON_0 + i;
+-        BYTE old_button = impl->base.device_state[ios_objects[index].dwOfs];
++        UINT index = nvalues + i;
++        BYTE old_button = impl->base.device_state[table[index].dwOfs];
+ 
+-        impl->base.device_state[ios_objects[index].dwOfs] = buttons[i];
++        impl->base.device_state[table[index].dwOfs] = buttons[i];
+         if (queue && old_button != buttons[i]) queue_event( iface, index, buttons[i], time, seq );
+     }
+ 
