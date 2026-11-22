@@ -1,0 +1,234 @@
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index 7257ecf..51c527c 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -406,6 +406,11 @@ public:
+       Dst.Width = std::max(1u, dst_desc.Width >> Dst.MipLevel);
+       Dst.Height = std::max(1u, dst_desc.Height >> Dst.MipLevel);
+       Dst.Depth = 1;
++      /* MADEIRA: an NV12 copy moves both planes (Height * 3/2 R8 rows). */
++      if (src_desc.Format == DXGI_FORMAT_NV12)
++        Src.Height = src_desc.Height + src_desc.Height / 2;
++      if (dst_desc.Format == DXGI_FORMAT_NV12)
++        Dst.Height = dst_desc.Height + dst_desc.Height / 2;
+       break;
+     }
+     case D3D11_RESOURCE_DIMENSION_TEXTURE3D: {
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 3cb10ab..c082a84 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -1041,6 +1041,10 @@ public:
+       switch (pDesc->Usage) {
+       case D3D11_USAGE_DEFAULT:
+       case D3D11_USAGE_IMMUTABLE:
++        /* MADEIRA: NV12 lives in a buffer-backed texture (both planes in one
++         * allocation, planes as views): see d3d11_texture_linear.cpp. */
++        if (pDesc->Format == DXGI_FORMAT_NV12)
++          return CreateDynamicLinearTexture2D(this, pDesc, pInitialData, ppTexture2D);
+         return CreateDeviceTexture2D(this, pDesc, pInitialData, ppTexture2D);
+       case D3D11_USAGE_DYNAMIC: {
+         HRESULT hr = CreateDynamicLinearTexture2D(this, pDesc, pInitialData, ppTexture2D);
+diff --git a/src/d3d11/d3d11_resource_helper.cpp b/src/d3d11/d3d11_resource_helper.cpp
+index 83f36c0..ee03885 100644
+--- a/src/d3d11/d3d11_resource_helper.cpp
++++ b/src/d3d11/d3d11_resource_helper.cpp
+@@ -648,6 +648,17 @@ GetLinearTextureLayout(
+   if (Aligned && !(metal_format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER))) {
+     alignment = metal.minimumLinearTextureAlignmentForPixelFormat(metal_format.PixelFormat);
+   }
++  if (metal_format.Flag & MTL_DXGI_FORMAT_NV12) {
++    /* MADEIRA: the chroma plane is read through an RG8 texture made on the same
++     * buffer at offset BytesPerRow * h, so the row pitch must suit RG8 too. */
++    if (Aligned)
++      alignment = std::max(alignment, (uint32_t)metal.minimumLinearTextureAlignmentForPixelFormat(WMTPixelFormatRG8Unorm));
++    auto nv12_bytes_per_row = align(bytes_per_row_unaligned, alignment);
++    BytesPerRow = nv12_bytes_per_row;
++    BytesPerImage = nv12_bytes_per_row * (h + (h + 1) / 2);
++    BytesPerSlice = BytesPerImage;
++    return S_OK;
++  }
+   auto aligned_bytes_per_row = align(bytes_per_row_unaligned, alignment);
+   BytesPerRow = aligned_bytes_per_row;
+   BytesPerImage = aligned_bytes_per_row * h;
+diff --git a/src/d3d11/d3d11_texture_linear.cpp b/src/d3d11/d3d11_texture_linear.cpp
+index 1de2d4b..5804dd8 100644
+--- a/src/d3d11/d3d11_texture_linear.cpp
++++ b/src/d3d11/d3d11_texture_linear.cpp
+@@ -115,14 +115,35 @@ HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_2d>::CreateShaderRes
+     return E_FAIL;
+   }
+ 
+-  auto view_key = texture_->createView(
++  TextureViewDescriptor view_desc =
+       {.format = format.PixelFormat,
+        .type = WMTTextureType2D,
+        .firstMiplevel = 0,
+        .miplevelCount = 1,
+        .firstArraySlice = 0,
+-       .arraySize = 1}
+-  );
++       .arraySize = 1};
++  if (this->desc.Format == DXGI_FORMAT_NV12) {
++    /* MADEIRA: D3D11 picks the NV12 plane by the view format: an 8-bit
++     * single-channel view is the luma plane, a two-channel one the chroma. */
++    switch (finalDesc.Format) {
++    case DXGI_FORMAT_R8_UNORM:
++    case DXGI_FORMAT_R8_UINT:
++    case DXGI_FORMAT_NV12:
++      view_desc.format = WMTPixelFormatR8Unorm;
++      view_desc.nv12Plane = 1;
++      break;
++    case DXGI_FORMAT_R8G8_UNORM:
++    case DXGI_FORMAT_R8G8_UINT:
++      view_desc.format = WMTPixelFormatRG8Unorm;
++      view_desc.nv12Plane = 2;
++      break;
++    default:
++      ERR("NV12 texture: unsupported SRV format ", finalDesc.Format);
++      return E_INVALIDARG;
++    }
++  }
++
++  auto view_key = texture_->createView(view_desc);
+ 
+   auto srv = ref(new SRV(&finalDesc, this, this->m_parent, view_key));
+ 
+@@ -205,6 +226,13 @@ CreateDynamicLinearTexture2D(
+   if (FAILED(GetLinearTextureLayout(pDevice, finalDesc, 0, bytesPerRow, bytesPerImage, bufferLen))) {
+     return E_FAIL;
+   }
++  if (format.Flag & MTL_DXGI_FORMAT_NV12) {
++    /* MADEIRA: the backing R8 texture covers both planes, so copies and
++     * Map move the chroma rows along with the luma ones. */
++    if ((pDesc->Width & 1) || (pDesc->Height & 1))
++      return E_INVALIDARG;
++    info.height = pDesc->Height + pDesc->Height / 2;
++  }
+ 
+   *ppTexture = reinterpret_cast<ID3D11Texture2D1 *>(
+       ref(new TDynamicLinearTexture<tag_texture_2d>(&finalDesc, info, pInitialData, bufferLen, bytesPerRow, pDevice))
+diff --git a/src/dxmt/dxmt_format.cpp b/src/dxmt/dxmt_format.cpp
+index ab83058..585bb33 100644
+--- a/src/dxmt/dxmt_format.cpp
++++ b/src/dxmt/dxmt_format.cpp
+@@ -1056,10 +1056,19 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
+     description.BytesPerTexel = 2;
+     break;
+   }
++  case DXGI_FORMAT_NV12: {
++    /* MADEIRA: Media Foundation's sample allocator asks for NV12 video
++     * frames (KINGDOM HEARTS Dream Drop Distance's opening movie). Stored as
++     * an R8 linear texture of Height * 3/2 rows; R8 / R8G8 views select the
++     * luma / chroma plane (d3d11_texture_linear.cpp). */
++    description.PixelFormat = WMTPixelFormatR8Unorm;
++    description.BytesPerTexel = 1;
++    description.Flag = MTL_DXGI_FORMAT_NV12;
++    break;
++  }
+   case DXGI_FORMAT_AYUV:
+   case DXGI_FORMAT_Y410:
+   case DXGI_FORMAT_Y416:
+-  case DXGI_FORMAT_NV12:
+   case DXGI_FORMAT_P010:
+   case DXGI_FORMAT_P016:
+   case DXGI_FORMAT_420_OPAQUE:
+diff --git a/src/dxmt/dxmt_format.hpp b/src/dxmt/dxmt_format.hpp
+index e922f1f..dac354b 100644
+--- a/src/dxmt/dxmt_format.hpp
++++ b/src/dxmt/dxmt_format.hpp
+@@ -60,6 +60,9 @@ enum MTL_DXGI_FORMAT_FLAG {
+   MTL_DXGI_FORMAT_STENCIL_PLANER = 32,
+   MTL_DXGI_FORMAT_EMULATED_D24 = 256,
+   MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL = 512,
++  // MADEIRA: DXGI_FORMAT_NV12 as an R8 linear texture of Height * 3/2 rows: the
++  // luma plane, then the interleaved CbCr plane at the same row pitch.
++  MTL_DXGI_FORMAT_NV12 = 1024,
+ };
+ 
+ struct MTL_DXGI_FORMAT_DESC {
+diff --git a/src/dxmt/dxmt_texture.cpp b/src/dxmt/dxmt_texture.cpp
+index 82a53ec..cd3690c 100644
+--- a/src/dxmt/dxmt_texture.cpp
++++ b/src/dxmt/dxmt_texture.cpp
+@@ -31,6 +31,32 @@ TextureView::TextureView(TextureAllocation *allocation, TextureViewKey key, Text
+     allocation(allocation),
+     key(key) {
+   auto parent = allocation->texture();
++  if (descriptor.nv12Plane && allocation->buffer()) {
++    /* MADEIRA: an NV12 plane. The allocation's texture is R8 over the whole
++     * buffer (luma rows, then chroma rows); each plane is its own texture on
++     * the same memory, so sampling sees exactly one plane. */
++    WMTTextureInfo info = allocation->bufferTextureInfo();
++    unsigned luma_height = info.height / 3 * 2;
++    uint64_t offset = 0;
++    info.type = WMTTextureType2D;
++    info.mipmap_level_count = 1;
++    info.array_length = 1;
++    info.usage = WMTTextureUsageShaderRead;
++    info.mach_port = 0;
++    if (descriptor.nv12Plane == 2) {
++      info.pixel_format = WMTPixelFormatRG8Unorm;
++      info.width = (info.width + 1) / 2;
++      info.height = (luma_height + 1) / 2;
++      offset = (uint64_t)allocation->bytesPerRow() * luma_height;
++    } else {
++      info.pixel_format = WMTPixelFormatR8Unorm;
++      info.height = luma_height;
++    }
++    auto buffer = allocation->buffer();
++    texture = buffer.newTexture(info, offset, allocation->bytesPerRow());
++    gpuResourceID = info.gpu_resource_id;
++    return;
++  }
+   texture = parent.newTextureView(
+       descriptor.format, descriptor.type, descriptor.firstMiplevel, descriptor.miplevelCount,
+       descriptor.firstArraySlice, descriptor.arraySize, descriptor.swizzle, gpuResourceID
+@@ -47,6 +73,8 @@ TextureAllocation::TextureAllocation(
+     flags_(flags) {
+   auto info_copy = info;
+   obj_ = buffer_.newTexture(info_copy, 0, bytes_per_row);
++  buffer_texture_info_ = info;
++  bytes_per_row_ = bytes_per_row;
+ 
+   gpuResourceID = info_copy.gpu_resource_id;
+   machPort = 0;
+@@ -105,6 +133,8 @@ Texture::createView(TextureViewDescriptor const &descriptor) {
+       continue;
+     if (!SwizzleEqual(viewDescriptors_[i].swizzle, descriptor.swizzle))
+       continue;
++    if (viewDescriptors_[i].nv12Plane != descriptor.nv12Plane)
++      continue;
+     return i;
+   }
+   viewDescriptors_.push_back(descriptor);
+diff --git a/src/dxmt/dxmt_texture.hpp b/src/dxmt/dxmt_texture.hpp
+index 849641d..c0bbf82 100644
+--- a/src/dxmt/dxmt_texture.hpp
++++ b/src/dxmt/dxmt_texture.hpp
+@@ -41,6 +41,10 @@ struct TextureViewDescriptor {
+       WMTTextureSwizzleBlue,
+       WMTTextureSwizzleAlpha,
+   };
++  // MADEIRA: NV12 plane of a buffer-backed texture (0: not a plane view,
++  // 1: luma as R8, 2: chroma as RG8). A plane view is a new texture made on
++  // the allocation's buffer, not a texture view. Part of the view identity.
++  uint8_t nv12Plane = 0;
+ };
+ 
+ inline bool
+@@ -146,6 +150,14 @@ private:
+ 
+   WMT::Reference<WMT::Texture> obj_;
+   WMT::Reference<WMT::Buffer> buffer_;
++  WMTTextureInfo buffer_texture_info_{};   // MADEIRA: the info obj_ was made from (buffer-backed only)
++  unsigned bytes_per_row_ = 0;             // MADEIRA: its row pitch
++
++public:
++  const WMTTextureInfo &bufferTextureInfo() const { return buffer_texture_info_; }
++  unsigned bytesPerRow() const { return bytes_per_row_; }
++
++private:
+   uint32_t version_ = 0;
+   Flags<TextureAllocationFlag> flags_;
+   std::vector<TextureViewRef> cached_view_;
