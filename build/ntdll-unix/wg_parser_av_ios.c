@@ -171,6 +171,7 @@ enum mav_codec_kind
     MAV_CODEC_HEVC = 5,
     MAV_CODEC_MPEG1 = 6,
     MAV_CODEC_MPEG2 = 7,
+    MAV_CODEC_VP9 = 8,
 };
 
 struct mav_output
@@ -331,6 +332,7 @@ struct mav_lavc_vdec
     uint32_t seqhdr_len;
     int need_seqhdr;            /* flushed: the next packet gets seqhdr in front unless it has one */
     int have_key;               /* a keyframe was output since open / the last flush */
+    int is_mpeg;                /* MPEG-1/2: the sequence-header handling above applies (not VP9) */
 };
 
 /* The sequence header at the start of a packet: from 00 00 01 B3 up to the next
@@ -355,7 +357,18 @@ struct mav_lavc_pic
 
 static int mav_lavc_vsupports( int codec )
 {
-    return codec == MAV_BACKEND_MPEG1 || codec == MAV_BACKEND_MPEG2;
+    return codec == MAV_BACKEND_MPEG1 || codec == MAV_BACKEND_MPEG2 || codec == MAV_BACKEND_VP9;
+}
+
+static enum AVCodecID mav_lavc_codec_id( int codec )
+{
+    switch (codec)
+    {
+    case MAV_BACKEND_MPEG1: return AV_CODEC_ID_MPEG1VIDEO;
+    case MAV_BACKEND_MPEG2: return AV_CODEC_ID_MPEG2VIDEO;
+    case MAV_BACKEND_VP9:   return AV_CODEC_ID_VP9;
+    default:                return AV_CODEC_ID_NONE;
+    }
 }
 
 static void mav_lavc_vclose( void *handle )
@@ -371,12 +384,14 @@ static void mav_lavc_vclose( void *handle )
 static void *mav_lavc_vopen( int codec, const uint8_t *extradata, uint32_t extradata_size,
                              uint32_t width, uint32_t height, char *why, size_t why_size )
 {
-    const AVCodec *c = avcodec_find_decoder( codec == MAV_BACKEND_MPEG1 ? AV_CODEC_ID_MPEG1VIDEO : AV_CODEC_ID_MPEG2VIDEO );
+    const AVCodec *c = avcodec_find_decoder( mav_lavc_codec_id( codec ) );
     struct mav_lavc_vdec *d;
+    int mpeg = codec == MAV_BACKEND_MPEG1 || codec == MAV_BACKEND_MPEG2;
 
     if (!c)
     {
-        snprintf( why, why_size, "libavcodec has no %s decoder in this build", codec == MAV_BACKEND_MPEG1 ? "mpeg1video" : "mpeg2video" );
+        snprintf( why, why_size, "libavcodec has no %s decoder in this build",
+                  codec == MAV_BACKEND_MPEG1 ? "mpeg1video" : codec == MAV_BACKEND_MPEG2 ? "mpeg2video" : "vp9" );
         return NULL;
     }
     if (!(d = calloc( 1, sizeof(*d) ))) return NULL;
@@ -388,9 +403,17 @@ static void *mav_lavc_vopen( int codec, const uint8_t *extradata, uint32_t extra
     d->ctx->width = width;
     d->ctx->height = height;
     d->ctx->thread_count = 1;
+    d->is_mpeg = mpeg;
+    /* VP9 is decoded in software (no hardware path here, and this FFmpeg has no
+     * assembly): frame threads keep a 1080p30 movie in real time. */
+    if (!mpeg)
+    {
+        d->ctx->thread_count = 4;
+        d->ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    }
     /* The container's sequence header: decoding can start at a GOP that does not
      * repeat it (the analysis read past the first one, and a seek lands later). */
-    if (extradata && extradata_size)
+    if (mpeg && extradata && extradata_size)
     {
         if (!(d->ctx->extradata = av_mallocz( extradata_size + AV_INPUT_BUFFER_PADDING_SIZE )))
         {
@@ -413,7 +436,7 @@ static void *mav_lavc_vopen( int codec, const uint8_t *extradata, uint32_t extra
     /* A picture whose references are missing (the stream entered mid-GOP) is
      * not output: libavcodec would conceal it as a grey, blocky frame. */
     d->ctx->flags &= ~AV_CODEC_FLAG_OUTPUT_CORRUPT;
-    d->need_seqhdr = 1;
+    d->need_seqhdr = mpeg;
     if (avcodec_open2( d->ctx, c, NULL ) < 0)
     {
         snprintf( why, why_size, "%s decoder did not open", c->name );
@@ -432,7 +455,7 @@ static int mav_lavc_vdecode( void *handle, const uint8_t *data, uint32_t size, i
     (void)keyframe;
     if (data && size)
     {
-        uint32_t hdr = mav_mpeg_seqhdr_len( data, size ), pre = 0;
+        uint32_t hdr = d->is_mpeg ? mav_mpeg_seqhdr_len( data, size ) : 0, pre = 0;
 
         if (hdr && hdr <= sizeof(d->seqhdr))
         {
@@ -528,7 +551,7 @@ static void mav_lavc_vflush( void *handle )
 {
     struct mav_lavc_vdec *d = handle;
     avcodec_flush_buffers( d->ctx );
-    d->need_seqhdr = 1;
+    d->need_seqhdr = d->is_mpeg;
     d->have_key = 0;
 }
 
@@ -1263,6 +1286,7 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
     case AV_CODEC_ID_HEVC: codec = MAV_BACKEND_HEVC; s->info.kind = MAV_CODEC_HEVC; break;
     case AV_CODEC_ID_MPEG1VIDEO: codec = MAV_BACKEND_MPEG1; s->info.kind = MAV_CODEC_MPEG1; break;
     case AV_CODEC_ID_MPEG2VIDEO: codec = MAV_BACKEND_MPEG2; s->info.kind = MAV_CODEC_MPEG2; break;
+    case AV_CODEC_ID_VP9: codec = MAV_BACKEND_VP9; s->info.kind = MAV_CODEC_VP9; break;
     default:
         snprintf( why, why_size, "no decoder for it in this port" );
         return MAV_E_UNSUPPORTED;

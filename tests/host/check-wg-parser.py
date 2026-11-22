@@ -100,7 +100,8 @@ ff = (root / "build/ffmpeg/build.sh").read_text().replace("\r\n", "\n")
 args = ff[ff.index("CONFIG_ARGS=("):]
 args = args[:args.index("\n)\n")]
 assert "--enable-demuxer=mp3,wav,mov,mpegps,mpegvideo" in args, "mov and MPEG demuxers"
-assert "--enable-decoder=mpeg1video,mpeg2video" in args, "MPEG-1/2 video decoders"
+assert "--enable-decoder=mpeg1video,mpeg2video,vp9" in args, "MPEG-1/2 and VP9 video decoders"
+assert "--enable-bsf=vp9_superframe_split" in args, "VP9 superframe splitter"
 for flag in ["--disable-gpl", "--disable-nonfree", "--disable-version3", "--disable-everything"]:
     assert flag in args, ("LGPL-only configuration", flag)
 for bad in ["h264", "hevc", "aac"]:
@@ -120,8 +121,8 @@ tarball = os.environ.get("MADEIRA_FFMPEG_TARBALL") or str(root / "build/ffmpeg/s
 FLAGS = [
     "--disable-everything", "--disable-autodetect", "--disable-gpl", "--disable-nonfree", "--disable-version3",
     "--enable-decoder=mp1,mp2,mp3", "--enable-decoder=pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le",
-    "--enable-decoder=mpeg1video,mpeg2video",
-    "--enable-demuxer=mp3,wav,mov,mpegps,mpegvideo", "--enable-parser=mpegaudio,mpegvideo",
+    "--enable-decoder=mpeg1video,mpeg2video,vp9", "--enable-bsf=vp9_superframe_split",
+    "--enable-demuxer=mp3,wav,mov,mpegps,mpegvideo", "--enable-parser=mpegaudio,mpegvideo,vp9",
     # TEST ONLY: input synthesis, and the stand-in for AudioToolbox inside the stub AAC backend
     "--enable-encoder=mp2,aac", "--enable-muxer=mp4", "--enable-decoder=aac",
     "--disable-programs", "--disable-doc", "--disable-network", "--disable-avdevice", "--disable-swscale",

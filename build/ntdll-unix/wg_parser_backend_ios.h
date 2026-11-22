@@ -30,6 +30,7 @@ enum mav_backend_codec
     MAV_BACKEND_HEVC = 2,       /* extradata: hvcC, length-prefixed NAL packets */
     MAV_BACKEND_MPEG1 = 3,      /* MPEG-1 video elementary packets (no extradata) */
     MAV_BACKEND_MPEG2 = 4,      /* MPEG-2 video elementary packets (no extradata) */
+    MAV_BACKEND_VP9 = 5,        /* VP9 frames as the mov/MP4 demuxer gives them (vpcC extradata, ignored) */
     MAV_BACKEND_AAC = 16,       /* extradata: AudioSpecificConfig, one raw access unit per packet */
 };
 
