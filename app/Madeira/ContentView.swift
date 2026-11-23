@@ -2790,6 +2790,15 @@ struct ContentView: View {
                 // writes those). Either one turns a switch on.
                 Self.reassertBCDSwitches(profile)
                 logStore.log("[launch-route] library profile applied")
+                // ue-engine-ini: the game's Unreal Engine user Engine.ini lines (UnrealUserConfig).
+                do {
+                    let c = MadeiraConfig.parse(GameProfile(windowsPath: profile.windowsPath).text)
+                    if let v = c["ue-engine-ini"], !v.isEmpty {
+                        let rel = URL(fileURLWithPath: "/" + profile.relativePath)
+                        let folder = rel.pathExtension.isEmpty ? rel.lastPathComponent : rel.deletingLastPathComponent().lastPathComponent
+                        for line in UnrealUserConfig.apply(v, drive: LibraryModel.drive, names: [c["ue-project"] ?? "", folder]) { logStore.log(line) }
+                    }
+                }
                 // madeira-bcd: a Dock session of one-time installs runs without the game's
                 // address-space holds, which leave its 32-bit setups no room.
                 let dropped = DockInstallers.applyInstallSessionConfig()
@@ -3610,6 +3619,13 @@ struct ContentView: View {
             // (two device runs found no slot). ntdll holds one placeholder at session start.
             // env.MADEIRA_WOW_HOLD_WINDOWS in madeira.cfg or the game's file, exported after this, wins.
             let gameFolder = MadeiraDock.drive.appendingPathComponent(game.library + "/common/" + game.installDir, isDirectory: true)
+            // ue-engine-ini: the game's Unreal Engine user Engine.ini lines (UnrealUserConfig).
+            if let cfgText = profile.map({ GameProfile(windowsPath: $0.windowsPath).text }) {
+                let c = MadeiraConfig.parse(cfgText)
+                if let v = c["ue-engine-ini"], !v.isEmpty {
+                    for line in UnrealUserConfig.apply(v, drive: MadeiraDock.drive, names: [c["ue-project"] ?? "", game.installDir]) { logStore.log(line) }
+                }
+            }
             if DockGameSession.has32BitProgram(in: gameFolder, machine: DockInstallers.machine) {
                 setenv("MADEIRA_WOW_HOLD_WINDOWS", "1", 1)
                 logStore.log("[dock-wow] the game's folder holds a 32-bit program: one guest-window placeholder is held from session start (MADEIRA_WOW_HOLD_WINDOWS=1)")

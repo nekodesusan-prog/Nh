@@ -293,6 +293,102 @@ enum IniSettingHelp {
     ]
 }
 
+/// madeira: a game's `ue-engine-ini` line ("r.Distortion=0; r.DisableDistortion=1")
+/// written into the [SystemSettings] section of its Unreal Engine user Engine.ini
+/// (users/<name>/Documents/<game>/Saved/Config/WindowsNoEditor/Engine.ini, or
+/// Documents/My Games/<game>/..., AppData/Local/<game>/...) before each launch.
+/// The same settings a .pak "performance mod" carries, without adding files to
+/// the game's folder. Only folders the game already made are touched; `ue-project`
+/// names the folder when it differs from the game's own folder name.
+enum UnrealUserConfig {
+    static func pairs(_ value: String) -> [(key: String, value: String)] {
+        value.split(whereSeparator: { $0 == ";" || $0 == "\n" }).compactMap { item -> (key: String, value: String)? in
+            let t = item.trimmingCharacters(in: .whitespaces)
+            guard let eq = t.firstIndex(of: "=") else { return nil }
+            let k = t[..<eq].trimmingCharacters(in: .whitespaces), v = t[t.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            if k.isEmpty { return nil }
+            return (key: k, value: v)
+        }
+    }
+
+    /// `text` with each pair set in `section`: an existing key's line rewritten,
+    /// a missing one added at the end of the section (or a new section at the end).
+    static func merge(_ text: String, section: String, pairs: [(key: String, value: String)]) -> String {
+        let nl = text.contains("\r\n") ? "\r\n" : "\n"
+        var lines = text.components(separatedBy: nl)
+        if lines.last == "" { lines.removeLast() }
+        var current = "", sectionEnd: Int? = nil, done = Set<String>()
+        for i in lines.indices {
+            let t = lines[i].trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("["), let close = t.firstIndex(of: "]") {
+                current = String(t[t.index(after: t.startIndex)..<close])
+                if current.caseInsensitiveCompare(section) == .orderedSame { sectionEnd = i }
+                continue
+            }
+            guard current.caseInsensitiveCompare(section) == .orderedSame else { continue }
+            if !t.isEmpty { sectionEnd = i }
+            guard let eq = t.firstIndex(of: "=") else { continue }
+            let k = t[..<eq].trimmingCharacters(in: .whitespaces)
+            if let p = pairs.first(where: { $0.key.caseInsensitiveCompare(k) == .orderedSame }) {
+                lines[i] = "\(p.key)=\(p.value)"; done.insert(p.key.lowercased())
+            }
+        }
+        let missing = pairs.filter { !done.contains($0.key.lowercased()) }.map { "\($0.key)=\($0.value)" }
+        if !missing.isEmpty {
+            if let end = sectionEnd { lines.insert(contentsOf: missing, at: end + 1) }
+            else { if let l = lines.last, !l.isEmpty { lines.append("") }; lines.append("[\(section)]"); lines += missing }
+        }
+        return lines.joined(separator: nl) + nl
+    }
+
+    /// The Saved/Config/WindowsNoEditor folders under drive_c that belong to `names`.
+    static func configFolders(drive: URL, names: [String]) -> [URL] {
+        let fm = FileManager.default
+        let users = drive.appendingPathComponent("users", isDirectory: true)
+        let wanted = Set(names.map { $0.lowercased() }.filter { !$0.isEmpty })
+        var out: [URL] = []
+        for user in (try? fm.contentsOfDirectory(at: users, includingPropertiesForKeys: nil)) ?? [] {
+            for root in ["Documents", "Documents/My Games", "AppData/Local"] {
+                let base = user.appendingPathComponent(root, isDirectory: true)
+                for dir in (try? fm.contentsOfDirectory(at: base, includingPropertiesForKeys: nil)) ?? []
+                where wanted.contains(dir.lastPathComponent.lowercased()) {
+                    let cfg = dir.appendingPathComponent("Saved/Config/WindowsNoEditor", isDirectory: true)
+                    var isDir: ObjCBool = false
+                    if fm.fileExists(atPath: dir.appendingPathComponent("Saved").path, isDirectory: &isDir), isDir.boolValue { out.append(cfg) }
+                }
+            }
+        }
+        return out
+    }
+
+    /// Writes `value` (a `ue-engine-ini` line) into each matching Engine.ini; returns log lines.
+    @discardableResult
+    static func apply(_ value: String, drive: URL, names: [String]) -> [String] {
+        let ps = pairs(value)
+        guard !ps.isEmpty else { return ["[ue-ini] ue-engine-ini has no key=value pairs"] }
+        let folders = configFolders(drive: drive, names: names)
+        guard !folders.isEmpty else {
+            return ["[ue-ini] no Saved folder for \(names.joined(separator: " / ")) under Documents, My Games or AppData/Local; start the game once, or name the folder with ue-project"]
+        }
+        var log: [String] = []
+        for folder in folders {
+            let file = folder.appendingPathComponent("Engine.ini")
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            var text = "", utf16 = false
+            if let data = try? Data(contentsOf: file) {
+                if data.starts(with: [0xFF, 0xFE]) { utf16 = true; text = String(data: data, encoding: .utf16LittleEndian) ?? "" }
+                else { text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? "" }
+                if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
+            }
+            let merged = merge(text, section: "SystemSettings", pairs: ps)
+            let out = utf16 ? Data([0xFF, 0xFE]) + (merged.data(using: .utf16LittleEndian) ?? Data()) : Data(merged.utf8)
+            do { try out.write(to: file, options: .atomic); log.append("[ue-ini] \(file.path.components(separatedBy: "drive_c/").last ?? file.path): [SystemSettings] \(ps.map { "\($0.key)=\($0.value)" }.joined(separator: " "))") }
+            catch { log.append("[ue-ini] could not write \(file.lastPathComponent): \(error.localizedDescription)") }
+        }
+        return log
+    }
+}
+
 // MARK: Views
 
 /// Game details › Settings files: the game's added .ini files, and "Add .ini file".
