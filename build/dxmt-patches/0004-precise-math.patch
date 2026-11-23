@@ -1,0 +1,97 @@
+diff --git a/src/airconv/nt/air_builder.cpp b/src/airconv/nt/air_builder.cpp
+index d9e26ca..aefe2bd 100644
+--- a/src/airconv/nt/air_builder.cpp
++++ b/src/airconv/nt/air_builder.cpp
+@@ -1,3 +1,5 @@
++#include <cstdio>
++#include <cstdlib>
+ #include "air_builder.hpp"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/IR/DerivedTypes.h"
+@@ -8,6 +10,24 @@
+ #include "llvm/Support/raw_ostream.h"
+ #include <format>
+ 
++/* MADEIRA: DXMT_PRECISE_MATH=1 uses Metal's precise math functions (air.rsqrt,
++ * air.log2, air.pow, ...) instead of the fast ones, and no fast-math flags.
++ * The fast variants leave edge cases undefined (log2(0), pow(0, y), rsqrt(0)),
++ * where D3D11 gives -inf/0/inf; a NaN from one of them reached KINGDOM HEARTS
++ * III's post-processing (white bloom discs, then dark blocks around characters).
++ * Opt-in; dxmt_shader_cache.cpp keeps a separate cache file for it. */
++extern "C" bool
++madeira_precise_math() {
++  static int mode = -1;
++  if (mode < 0) {
++    const char *e = getenv("DXMT_PRECISE_MATH");
++    mode = (e && e[0] == '1') ? 1 : 0;
++    if (mode)
++      fprintf(stderr, "[airconv] DXMT_PRECISE_MATH: precise math functions, no fast-math flags\n");
++  }
++  return mode != 0;
++}
++
+ namespace llvm::air {
+ 
+ struct TextureOperationInfo {
+@@ -100,6 +120,7 @@ AIRBuilder::getTypeOverloadSuffix(Type *Ty, Signedness Sign) {
+   return Ret;
+ }
+ 
++
+ Value *
+ AIRBuilder::CreateAtomicRMW(
+     const Texture &Texture, Value *Handle, AtomicRMWInst::BinOp Op, Value *Pos, Value *ValVec4, Value *ArrayIndex
+@@ -1661,7 +1682,7 @@ AIRBuilder::CreateFPUnOp(FPUnOp Op, Value *Operand, bool FastVariant) {
+   auto OperandType = Operand->getType();
+ 
+   std::string FnName = "air.";
+-  if (FastVariant)
++  if (FastVariant && !madeira_precise_math())
+     FnName += "fast_";
+   FnName += FnNames[Op];
+   FnName += getTypeOverloadSuffix(OperandType);
+@@ -1691,7 +1712,7 @@ AIRBuilder::CreateFPBinOp(FPBinOp Op, Value *LHS, Value *RHS, bool FastVariant)
+   auto OperandType = LHS->getType();
+ 
+   std::string FnName = "air.";
+-  if (FastVariant)
++  if (FastVariant && !madeira_precise_math())
+     FnName += "fast_";
+   FnName += FnNames[Op];
+   FnName += getTypeOverloadSuffix(OperandType);
+diff --git a/src/airconv/nt/dxbc_converter_base.cpp b/src/airconv/nt/dxbc_converter_base.cpp
+index 1cc24a1..5eec063 100644
+--- a/src/airconv/nt/dxbc_converter_base.cpp
++++ b/src/airconv/nt/dxbc_converter_base.cpp
+@@ -30,6 +30,8 @@ madeira_precise_minmax() {
+   return mode != 0;
+ }
+ 
++extern "C" bool madeira_precise_math();   /* MADEIRA: nt/air_builder.cpp */
++
+ namespace dxmt::dxbc {
+ 
+ llvm::ArrayType *
+@@ -3030,7 +3032,7 @@ Converter::CreateGEPInt32WithBoundCheck(AtomicBufferResourceHandle &Buffer, llvm
+ 
+ std::unique_ptr<llvm::IRBuilder<>::FastMathFlagGuard>
+ Converter::UseFastMath(bool OptOut) {
+-  if (OptOut)
++  if (OptOut || madeira_precise_math())
+     return nullptr;
+   auto Guard = std::make_unique<llvm::IRBuilder<>::FastMathFlagGuard>(ir);
+   llvm::FastMathFlags FMF;
+diff --git a/src/dxmt/dxmt_shader_cache.cpp b/src/dxmt/dxmt_shader_cache.cpp
+index 697dedd..d856123 100644
+--- a/src/dxmt/dxmt_shader_cache.cpp
++++ b/src/dxmt/dxmt_shader_cache.cpp
+@@ -63,7 +63,8 @@ ShaderCache::ShaderCache(WMTMetalVersion metal_version) {
+   /* madeira ml1382: shaders built with DXMT_PRECISE_MINMAX=0 (fast min/max) get their own file */
+   path += str::format("shaders_", (unsigned int)metal_version,
+                       env::getEnvVar("DXMT_PRECISE_MINMAX") == "0" ? "_fastminmax" : "",
+-                      env::getEnvVar("DXMT_PS_NAN_GUARD") == "1" ? "_nanguard" : "", ".db");
++                      env::getEnvVar("DXMT_PS_NAN_GUARD") == "1" ? "_nanguard" : "",
++                      env::getEnvVar("DXMT_PRECISE_MATH") == "1" ? "_precise" : "", ".db");
+   scache_writer_ = WMT::CacheWriter::alloc_init(path.c_str(), kDXMTShaderCacheVersion);
+   scache_reader_ = WMT::CacheReader::alloc_init(path.c_str(), kDXMTShaderCacheVersion);
+ }
