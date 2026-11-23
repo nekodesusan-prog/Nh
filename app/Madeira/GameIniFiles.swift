@@ -295,7 +295,7 @@ enum IniSettingHelp {
 
 /// madeira: a game's `ue-engine-ini` line ("r.Distortion=0; r.DisableDistortion=1")
 /// written into the [SystemSettings] section of its Unreal Engine user Engine.ini
-/// (users/<name>/Documents/<game>/Saved/Config/WindowsNoEditor/Engine.ini, or
+/// (users/<name>/Documents/<game>/Saved/Config[/WindowsNoEditor]/Engine.ini, or
 /// Documents/My Games/<game>/..., AppData/Local/<game>/...) before each launch.
 /// The same settings a .pak "performance mod" carries, without adding files to
 /// the game's folder. Only folders the game already made are touched; `ue-project`
@@ -352,9 +352,14 @@ enum UnrealUserConfig {
                 let base = user.appendingPathComponent(root, isDirectory: true)
                 for dir in (try? fm.contentsOfDirectory(at: base, includingPropertiesForKeys: nil)) ?? []
                 where wanted.contains(dir.lastPathComponent.lowercased()) {
-                    let cfg = dir.appendingPathComponent("Saved/Config/WindowsNoEditor", isDirectory: true)
+                    // Most games keep Saved/Config/WindowsNoEditor; KINGDOM HEARTS III keeps
+                    // GameUserSettings.ini straight in Saved/Config.
+                    let config = dir.appendingPathComponent("Saved/Config", isDirectory: true)
+                    let noEditor = config.appendingPathComponent("WindowsNoEditor", isDirectory: true)
                     var isDir: ObjCBool = false
-                    if fm.fileExists(atPath: dir.appendingPathComponent("Saved").path, isDirectory: &isDir), isDir.boolValue { out.append(cfg) }
+                    if fm.fileExists(atPath: noEditor.path, isDirectory: &isDir), isDir.boolValue { out.append(noEditor) }
+                    else if fm.fileExists(atPath: config.appendingPathComponent("GameUserSettings.ini").path) { out.append(config) }
+                    else if fm.fileExists(atPath: dir.appendingPathComponent("Saved").path, isDirectory: &isDir), isDir.boolValue { out.append(noEditor) }
                 }
             }
         }
