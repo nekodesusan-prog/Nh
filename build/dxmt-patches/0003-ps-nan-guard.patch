@@ -1,0 +1,71 @@
+diff --git a/src/airconv/dxbc_converter_basicblock.cpp b/src/airconv/dxbc_converter_basicblock.cpp
+index f9bad1c..4265444 100644
+--- a/src/airconv/dxbc_converter_basicblock.cpp
++++ b/src/airconv/dxbc_converter_basicblock.cpp
+@@ -343,6 +343,43 @@ pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element) {
+  * against exports (0,0,0,1) for unexported channels, which is what makes the
+  * game's own idiom (blend with the source alpha the shader never wrote) do
+  * what its authors saw. Same convention here. */
++/* MADEIRA: DXMT_PS_NAN_GUARD=1 cleans a float render-target output before it is
++ * written: NaN becomes 0 and +/-Inf becomes +/-65504 (the largest half float).
++ * One such texel in an HDR scene buffer is spread by bloom and lens-flare blurs
++ * into a growing white disc (KINGDOM HEARTS III's light shafts). Opt-in;
++ * dxmt_shader_cache.cpp keeps a separate cache file for it. */
++static bool
++madeira_ps_nan_guard() {
++  static int mode = -1;
++  if (mode < 0) {
++    const char *e = getenv("DXMT_PS_NAN_GUARD");
++    mode = (e && e[0] == '1') ? 1 : 0;
++    if (mode)
++      fprintf(stderr, "[airconv] DXMT_PS_NAN_GUARD: render-target NaN -> 0, Inf -> +/-65504\n");
++  }
++  return mode != 0;
++}
++
++static llvm::Value *
++madeira_guard_float_vec(llvm::IRBuilder<> &b, llvm::Value *v) {
++  auto *vt = llvm::dyn_cast<llvm::FixedVectorType>(v->getType());
++  if (!vt || !vt->getElementType()->isFloatingPointTy())
++    return v;
++  auto *et = vt->getElementType();
++  auto n = vt->getNumElements();
++  auto *zero = llvm::ConstantVector::getSplat(llvm::ElementCount::getFixed(n), llvm::ConstantFP::get(et, 0.0));
++  auto *hmax = llvm::ConstantVector::getSplat(llvm::ElementCount::getFixed(n), llvm::ConstantFP::get(et, 65504.0));
++  auto *hmin = llvm::ConstantVector::getSplat(llvm::ElementCount::getFixed(n), llvm::ConstantFP::get(et, -65504.0));
++  auto *pinf = llvm::ConstantVector::getSplat(llvm::ElementCount::getFixed(n), llvm::ConstantFP::getInfinity(et, false));
++  auto *ninf = llvm::ConstantVector::getSplat(llvm::ElementCount::getFixed(n), llvm::ConstantFP::getInfinity(et, true));
++  llvm::IRBuilder<>::FastMathFlagGuard guard(b);
++  b.setFastMathFlags(llvm::FastMathFlags());
++  v = b.CreateSelect(b.CreateFCmpUNO(v, v), zero, v);
++  v = b.CreateSelect(b.CreateFCmpOEQ(v, pinf), hmax, v);
++  v = b.CreateSelect(b.CreateFCmpOEQ(v, ninf), hmin, v);
++  return v;
++}
++
+ std::function<IRValue(pvalue)> pop_output_reg_fill(uint32_t from_reg, uint32_t mask, uint32_t to_element) {
+   return [=](pvalue ret) {
+     return make_irvalue_bind([=](context ctx) -> IRValue {
+@@ -362,6 +399,8 @@ std::function<IRValue(pvalue)> pop_output_reg_fill(uint32_t from_reg, uint32_t m
+                                                       : llvm::ConstantInt::get(elem, i == 3 ? 1 : 0);
+         value = ctx.builder.CreateInsertElement(value, c, (uint64_t)i);
+       }
++      if (madeira_ps_nan_guard())
++        value = madeira_guard_float_vec(ctx.builder, value);
+       co_return ctx.builder.CreateInsertValue(ret, value, {to_element});
+     });
+   };
+diff --git a/src/dxmt/dxmt_shader_cache.cpp b/src/dxmt/dxmt_shader_cache.cpp
+index 5387c62..697dedd 100644
+--- a/src/dxmt/dxmt_shader_cache.cpp
++++ b/src/dxmt/dxmt_shader_cache.cpp
+@@ -62,7 +62,8 @@ ShaderCache::ShaderCache(WMTMetalVersion metal_version) {
+   std::string path = GetDXMTShaderCacheDirectory();
+   /* madeira ml1382: shaders built with DXMT_PRECISE_MINMAX=0 (fast min/max) get their own file */
+   path += str::format("shaders_", (unsigned int)metal_version,
+-                      env::getEnvVar("DXMT_PRECISE_MINMAX") == "0" ? "_fastminmax" : "", ".db");
++                      env::getEnvVar("DXMT_PRECISE_MINMAX") == "0" ? "_fastminmax" : "",
++                      env::getEnvVar("DXMT_PS_NAN_GUARD") == "1" ? "_nanguard" : "", ".db");
+   scache_writer_ = WMT::CacheWriter::alloc_init(path.c_str(), kDXMTShaderCacheVersion);
+   scache_reader_ = WMT::CacheReader::alloc_init(path.c_str(), kDXMTShaderCacheVersion);
+ }
