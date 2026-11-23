@@ -4157,7 +4157,7 @@ struct LibraryDetail: View {
     /// The value a page's row shows, when one setting sums it up.
     private func summary(_ page: Page) -> String? {
         switch page {
-        case .display: return entry.metalFXUpscale.map { "\(entry.resolution) · MetalFX \($0 == 2 ? "2" : "1.5")×" } ?? entry.resolution
+        case .display: return entry.metalFXUpscale.map { "\(entry.resolution) · MetalFX \($0 == $0.rounded() ? String(Int($0)) : String($0))×" } ?? entry.resolution
         case .controls: return entry.controllerMode == "keys" ? "Keyboard and mouse" : entry.controllerMode == "dinput" ? "XInput and DirectInput" : nil
         case .launch: return entry.usesLaunchOptions ? (entry.runsInDesktop ? L("Wine desktop") : L("Directly")) : nil
         case .steam: return entry.startsSteamGameDirectly ? "The game" : "Madeira Dock"
@@ -4224,6 +4224,8 @@ struct LibraryDetail: View {
                 Text("Off").tag(Double?.none)
                 Text("1.5×").tag(Double?.some(1.5))
                 Text("2×").tag(Double?.some(2))
+                Text("3×").tag(Double?.some(3))
+                Text("4×").tag(Double?.some(4))
             }
             Toggle("Frame generation (experimental)", isOn: Binding(get: { entry.frameGeneration ?? false }, set: { entry.frameGeneration = $0 ? true : nil }))
             if entry.frameGeneration == true {

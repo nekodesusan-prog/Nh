@@ -21805,7 +21805,7 @@ static void mad_swap_make_fx(struct mad_swapchain *s) {
     if (!mad_cfg_str_pe("metalfx-upscale", v, sizeof v) || !v[0]) return;
     f = strtod(v, NULL);
     if (!(f >= 1.1)) return;
-    if (f > 2.0) f = 2.0;   /* as DXMT's D3D11 MetalFX swapchain, which takes 1 to 2 */
+    if (f > 4.0) f = 4.0;   /* 1 to 4, as the D3D11 MetalFX swapchain (3x/4x suit a low game resolution) */
     ow = ((UINT)(s->desc.Width * f + 0.5)) & ~1u;
     oh = ((UINT)(s->desc.Height * f + 0.5)) & ~1u;
     if (ow > 8192 || oh > 8192 || ow <= s->desc.Width) return;

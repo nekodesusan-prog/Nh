@@ -1357,7 +1357,7 @@ OVERLAY = {
                      "and nothing at all from a longer value (ml1255)."},
     "metalfx-upscale": {"title": "MetalFX upscaling factor", "kind": "choice",
              "note": "Scales the presented picture with Apple's MetalFX spatial scaler (Direct3D 11 and 12). Usually set per game in Game details > Display.",
-             "choices": [("", "Off"), ("1.5", "1.5x"), ("2", "2x")]},
+             "choices": [("", "Off"), ("1.5", "1.5x"), ("2", "2x"), ("3", "3x"), ("4", "4x")]},
 }
 
 

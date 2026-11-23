@@ -2985,11 +2985,11 @@ struct ContentView: View {
             // MetalFX spatial upscaling (metalfx-upscale; Game details › MetalFX
             // upscaling writes it to the game's own lines). The D3D12 runtime reads
             // the key itself; D3D11 games get DXMT's MetalFX swapchain at the same
-            // factor (DXMT takes 1 to 2).
+            // factor (1 to 4: 3x and 4x suit a low game resolution, e.g. 640x480 -> 2560x1920).
             if let txt = MadeiraConfig.gameValue("metalfx-upscale") ?? MadeiraConfig.get("metalfx-upscale"),
                let factor = Double(txt), factor >= 1.1 {
                 setenv("DXMT_METALFX_SPATIAL_SWAPCHAIN", "1", 1)
-                dxmtOptions.append("d3d11.metalSpatialUpscaleFactor=\(min(factor, 2))")
+                dxmtOptions.append("d3d11.metalSpatialUpscaleFactor=\(min(factor, 4))")
                 logStore.log("MetalFX upscaling: \(txt)x via metalfx-upscale")
             } else {
                 unsetenv("DXMT_METALFX_SPATIAL_SWAPCHAIN")
