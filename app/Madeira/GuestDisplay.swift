@@ -201,6 +201,9 @@ enum ResolutionChoices {
     static let defaultBudget = 1
     static let widescreen = [(960, 540), (1280, 720), (1600, 900), (1920, 1080), (2560, 1440)]
     static let classic = [(640, 480), (800, 600), (1024, 768), (1280, 960)]
+    /// Smaller sizes that games list in their own menus (KINGDOM HEARTS III offers
+    /// 960x600 ... 1176x664): picking the same size here keeps the game full screen.
+    static let more = [(960, 600), (960, 720), (1024, 600), (1024, 640), (1152, 648), (1176, 664)]
 
     static func aspect(_ s: Screen) -> Double {
         s.points.height > 0 ? Double(s.points.width / s.points.height) : 16.0 / 9
@@ -264,6 +267,11 @@ enum ResolutionChoices {
             if !rest.isEmpty {
                 out.append(Group(title: "\(name) · \(note)", choices: rest.map { Choice(w: $0.0, h: $0.1, label: "\($0.0)×\($0.1)") }))
             }
+        }
+        let listed = out.flatMap { $0.choices }
+        let rest = more.filter { size in !listed.contains(where: { $0.w == size.0 && $0.h == size.1 }) }
+        if !rest.isEmpty {
+            out.append(Group(title: "More sizes · match the game's own menu", choices: rest.map { Choice(w: $0.0, h: $0.1, label: "\($0.0)×\($0.1)") }))
         }
         return out
     }
