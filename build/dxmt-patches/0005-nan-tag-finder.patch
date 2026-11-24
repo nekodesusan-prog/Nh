@@ -1,0 +1,123 @@
+diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
+index db4ebbb..997f3bc 100644
+--- a/src/airconv/dxbc_converter.cpp
++++ b/src/airconv/dxbc_converter.cpp
+@@ -1503,6 +1503,8 @@ AIRCONV_API void SM50Destroy(sm50_shader_t pShader) {
+   delete (dxmt::dxbc::SM50ShaderInternal *)pShader;
+ }
+ 
++namespace dxmt::dxbc { extern thread_local uint32_t madeira_tag_shader; }   /* MADEIRA: DXMT_NAN_TAG */
++
+ AIRCONV_API int SM50Compile(
+   sm50_shader_t pShader, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs,
+   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
+@@ -1521,6 +1523,12 @@ AIRCONV_API int SM50Compile(
+     return 1;
+   }
+ 
++  {   /* MADEIRA: DXMT_NAN_TAG names a shader by its DXBC checksum (dxbc_converter_basicblock.cpp) */
++    auto *s0 = (dxbc::SM50ShaderInternal *)pShader;
++    dxmt::dxbc::madeira_tag_shader = 0;
++    if (s0 && s0->bytecode.size() >= 8)
++      memcpy(&dxmt::dxbc::madeira_tag_shader, s0->bytecode.data() + 4, 4);
++  }
+   std::unique_ptr<dxbc::SM50ShaderInternal> hold_pShader;
+   pShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pShader, hold_pShader);
+   if (!pShader) {
+diff --git a/src/airconv/dxbc_converter_basicblock.cpp b/src/airconv/dxbc_converter_basicblock.cpp
+index 4265444..6f63e5e 100644
+--- a/src/airconv/dxbc_converter_basicblock.cpp
++++ b/src/airconv/dxbc_converter_basicblock.cpp
+@@ -348,12 +348,36 @@ pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element) {
+  * One such texel in an HDR scene buffer is spread by bloom and lens-flare blurs
+  * into a growing white disc (KINGDOM HEARTS III's light shafts). Opt-in;
+  * dxmt_shader_cache.cpp keeps a separate cache file for it. */
++/* MADEIRA: DXMT_NAN_TAG=k (1-4) is a finder for the shader that makes the NaN:
++ * instead of 0, a NaN/Inf output gets a bright colour from 3 bits of the
++ * shader's DXBC checksum (k picks which 3), and each pixel shader compiled logs
++ * "[nan-tag] shader XXXXXXXX colour NAME". A screenshot of the coloured blocks
++ * then names a handful of shaders; another k narrows it to one. */
++thread_local uint32_t madeira_tag_shader = 0;
++static int
++madeira_nan_tag() {
++  static int k = -1;
++  if (k < 0) {
++    const char *e = getenv("DXMT_NAN_TAG");
++    k = (e && e[0] >= '1' && e[0] <= '4') ? e[0] - '0' : 0;
++    if (k)
++      fprintf(stderr, "[airconv] DXMT_NAN_TAG=%d: NaN/Inf render-target pixels are coloured by shader\n", k);
++  }
++  return k;
++}
++static unsigned
++madeira_tag_bits() {
++  int k = madeira_nan_tag();
++  return k ? (madeira_tag_shader >> (3 * (k - 1))) & 7u : 0u;
++}
++static const char *const madeira_tag_names[8] = {"grey", "red", "green", "yellow", "blue", "magenta", "cyan", "white"};
++
+ static bool
+ madeira_ps_nan_guard() {
+   static int mode = -1;
+   if (mode < 0) {
+     const char *e = getenv("DXMT_PS_NAN_GUARD");
+-    mode = (e && e[0] == '1') ? 1 : 0;
++    mode = (e && e[0] == '1') || madeira_nan_tag() ? 1 : 0;
+     if (mode)
+       fprintf(stderr, "[airconv] DXMT_PS_NAN_GUARD: render-target NaN -> 0, Inf -> +/-65504\n");
+   }
+@@ -374,6 +398,21 @@ madeira_guard_float_vec(llvm::IRBuilder<> &b, llvm::Value *v) {
+   auto *ninf = llvm::ConstantVector::getSplat(llvm::ElementCount::getFixed(n), llvm::ConstantFP::getInfinity(et, true));
+   llvm::IRBuilder<>::FastMathFlagGuard guard(b);
+   b.setFastMathFlags(llvm::FastMathFlags());
++  if (madeira_nan_tag() && n == 4) {
++    /* the whole pixel takes the shader's colour when any channel is NaN or +/-Inf */
++    unsigned bits = madeira_tag_bits();
++    double on = 50.0, grey = 8.0;
++    llvm::Constant *c[4];
++    for (unsigned i = 0; i < 3; i++)
++      c[i] = llvm::ConstantFP::get(et, bits ? ((bits >> i) & 1 ? on : 0.0) : grey);
++    c[3] = llvm::ConstantFP::get(et, 1.0);
++    auto *tag = llvm::ConstantVector::get(c);
++    auto *bad = b.CreateOr(b.CreateFCmpUNO(v, v),
++                           b.CreateOr(b.CreateFCmpOEQ(v, pinf), b.CreateFCmpOEQ(v, ninf)));
++    auto *any = b.CreateOr(b.CreateOr(b.CreateExtractElement(bad, (uint64_t)0), b.CreateExtractElement(bad, (uint64_t)1)),
++                           b.CreateOr(b.CreateExtractElement(bad, (uint64_t)2), b.CreateExtractElement(bad, (uint64_t)3)));
++    return b.CreateSelect(any, tag, v);
++  }
+   v = b.CreateSelect(b.CreateFCmpUNO(v, v), zero, v);
+   v = b.CreateSelect(b.CreateFCmpOEQ(v, pinf), hmax, v);
+   v = b.CreateSelect(b.CreateFCmpOEQ(v, ninf), hmin, v);
+@@ -399,8 +438,17 @@ std::function<IRValue(pvalue)> pop_output_reg_fill(uint32_t from_reg, uint32_t m
+                                                       : llvm::ConstantInt::get(elem, i == 3 ? 1 : 0);
+         value = ctx.builder.CreateInsertElement(value, c, (uint64_t)i);
+       }
+-      if (madeira_ps_nan_guard())
++      if (madeira_ps_nan_guard()) {
++        if (madeira_nan_tag() && elem->isFloatingPointTy()) {
++          static thread_local uint32_t logged = 0xffffffffu;
++          if (logged != madeira_tag_shader) {
++            logged = madeira_tag_shader;
++            fprintf(stderr, "[nan-tag] shader %08x colour %s (DXMT_NAN_TAG=%d)\n", madeira_tag_shader,
++                    madeira_tag_names[madeira_tag_bits()], madeira_nan_tag());
++          }
++        }
+         value = madeira_guard_float_vec(ctx.builder, value);
++      }
+       co_return ctx.builder.CreateInsertValue(ret, value, {to_element});
+     });
+   };
+diff --git a/src/dxmt/dxmt_shader_cache.cpp b/src/dxmt/dxmt_shader_cache.cpp
+index d856123..534f73d 100644
+--- a/src/dxmt/dxmt_shader_cache.cpp
++++ b/src/dxmt/dxmt_shader_cache.cpp
+@@ -64,7 +64,8 @@ ShaderCache::ShaderCache(WMTMetalVersion metal_version) {
+   path += str::format("shaders_", (unsigned int)metal_version,
+                       env::getEnvVar("DXMT_PRECISE_MINMAX") == "0" ? "_fastminmax" : "",
+                       env::getEnvVar("DXMT_PS_NAN_GUARD") == "1" ? "_nanguard" : "",
+-                      env::getEnvVar("DXMT_PRECISE_MATH") == "1" ? "_precise" : "", ".db");
++                      env::getEnvVar("DXMT_PRECISE_MATH") == "1" ? "_precise" : "",
++                      env::getEnvVar("DXMT_NAN_TAG").empty() ? "" : "_nantag" + env::getEnvVar("DXMT_NAN_TAG"), ".db");
+   scache_writer_ = WMT::CacheWriter::alloc_init(path.c_str(), kDXMTShaderCacheVersion);
+   scache_reader_ = WMT::CacheReader::alloc_init(path.c_str(), kDXMTShaderCacheVersion);
+ }
