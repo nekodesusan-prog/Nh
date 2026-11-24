@@ -1,0 +1,60 @@
+diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
+index 997f3bc..6938568 100644
+--- a/src/airconv/dxbc_converter.cpp
++++ b/src/airconv/dxbc_converter.cpp
+@@ -1,3 +1,7 @@
++#include <cstdio>
++#include <cstring>
++#include <set>
++#include <mutex>
+ #include "dxbc_converter.hpp"
+ #include "DXBCParser/BlobContainer.h"
+ #include "DXBCParser/ShaderBinary.h"
+@@ -1528,6 +1532,33 @@ AIRCONV_API int SM50Compile(
+     dxmt::dxbc::madeira_tag_shader = 0;
+     if (s0 && s0->bytecode.size() >= 8)
+       memcpy(&dxmt::dxbc::madeira_tag_shader, s0->bytecode.data() + 4, 4);
++    /* MADEIRA: DXMT_DUMP_SHADER=id[,id...] (ids as [nan-tag] prints them) writes that
++     * shader's DXBC into the log as base64, "[dxbc-dump] id part/parts data", once */
++    static std::mutex dump_lock;
++    static std::set<uint32_t> dumped;
++    const char *want = getenv("DXMT_DUMP_SHADER");
++    if (want && s0 && s0->bytecode.size() >= 8) {
++      char idhex[16];
++      snprintf(idhex, sizeof idhex, "%08x", dxmt::dxbc::madeira_tag_shader);
++      bool hit = strstr(want, idhex) != nullptr;
++      std::lock_guard<std::mutex> g(dump_lock);
++      if (hit && dumped.insert(dxmt::dxbc::madeira_tag_shader).second) {
++        static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++        const auto &bc = s0->bytecode;
++        std::string out;
++        for (size_t i = 0; i < bc.size(); i += 3) {
++          uint32_t v = bc[i] << 16 | (i + 1 < bc.size() ? bc[i + 1] << 8 : 0) | (i + 2 < bc.size() ? bc[i + 2] : 0);
++          out += b64[(v >> 18) & 63]; out += b64[(v >> 12) & 63];
++          out += i + 1 < bc.size() ? b64[(v >> 6) & 63] : '=';
++          out += i + 2 < bc.size() ? b64[v & 63] : '=';
++        }
++        const size_t chunk = 3000;
++        size_t parts = (out.size() + chunk - 1) / chunk;
++        fprintf(stderr, "[dxbc-dump] %s size %zu parts %zu\n", idhex, bc.size(), parts);
++        for (size_t k = 0; k < parts; k++)
++          fprintf(stderr, "[dxbc-dump] %s %zu/%zu %s\n", idhex, k + 1, parts, out.substr(k * chunk, chunk).c_str());
++      }
++    }
+   }
+   std::unique_ptr<dxbc::SM50ShaderInternal> hold_pShader;
+   pShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pShader, hold_pShader);
+diff --git a/src/dxmt/dxmt_shader_cache.cpp b/src/dxmt/dxmt_shader_cache.cpp
+index 534f73d..4d3f7e3 100644
+--- a/src/dxmt/dxmt_shader_cache.cpp
++++ b/src/dxmt/dxmt_shader_cache.cpp
+@@ -65,7 +65,8 @@ ShaderCache::ShaderCache(WMTMetalVersion metal_version) {
+                       env::getEnvVar("DXMT_PRECISE_MINMAX") == "0" ? "_fastminmax" : "",
+                       env::getEnvVar("DXMT_PS_NAN_GUARD") == "1" ? "_nanguard" : "",
+                       env::getEnvVar("DXMT_PRECISE_MATH") == "1" ? "_precise" : "",
+-                      env::getEnvVar("DXMT_NAN_TAG").empty() ? "" : "_nantag" + env::getEnvVar("DXMT_NAN_TAG"), ".db");
++                      env::getEnvVar("DXMT_NAN_TAG").empty() ? "" : "_nantag" + env::getEnvVar("DXMT_NAN_TAG"),
++                      env::getEnvVar("DXMT_DUMP_SHADER").empty() ? "" : "_dump", ".db");
+   scache_writer_ = WMT::CacheWriter::alloc_init(path.c_str(), kDXMTShaderCacheVersion);
+   scache_reader_ = WMT::CacheReader::alloc_init(path.c_str(), kDXMTShaderCacheVersion);
+ }
